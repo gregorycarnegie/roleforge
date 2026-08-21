@@ -71,24 +71,41 @@ fn first(value: &Value, keys: &[&str]) -> String {
         .unwrap_or_default()
 }
 
+type Adapter = fn(&Value) -> Result<Vec<JobLead>>;
+
+/// Keyed on the source's "platform", then on its "type"; anything unrecognised
+/// is treated as a plain feed.
+const BY_PLATFORM: &[(&str, Adapter)] = &[
+    ("greenhouse", greenhouse),
+    ("lever", lever),
+    ("ashby", ashby),
+    ("workable", workable),
+    ("generic_html", generic_html),
+];
+const BY_TYPE: &[(&str, Adapter)] = &[
+    ("efc_html", generic_html),
+    ("adzuna", adzuna),
+    ("reed", reed),
+    ("jooble", jooble),
+    ("themuse", themuse),
+    ("arbeitnow", arbeitnow),
+    ("remotive", remotive),
+];
+
+fn adapter(config: &Value) -> Adapter {
+    let look_up = |table: &[(&str, Adapter)], key: &str| {
+        table
+            .iter()
+            .find(|(name, _)| *name == key)
+            .map(|(_, adapter)| *adapter)
+    };
+    look_up(BY_PLATFORM, &cfg(config, "platform"))
+        .or_else(|| look_up(BY_TYPE, &cfg(config, "type")))
+        .unwrap_or(rss)
+}
+
 pub fn fetch(config: &Value) -> Result<Vec<JobLead>> {
-    match cfg(config, "platform").as_str() {
-        "greenhouse" => greenhouse(config),
-        "lever" => lever(config),
-        "ashby" => ashby(config),
-        "workable" => workable(config),
-        "generic_html" => generic_html(config),
-        _ => match cfg(config, "type").as_str() {
-            "efc_html" => generic_html(config),
-            "adzuna" => adzuna(config),
-            "reed" => reed(config),
-            "jooble" => jooble(config),
-            "themuse" => themuse(config),
-            "arbeitnow" => arbeitnow(config),
-            "remotive" => remotive(config),
-            _ => rss(config),
-        },
-    }
+    adapter(config)(config)
 }
 
 pub fn parse_feed(xml: &str, source: &str) -> Result<Vec<JobLead>> {
@@ -177,14 +194,20 @@ fn rss(config: &Value) -> Result<Vec<JobLead>> {
     } else {
         source
     };
-    let context = cfg(config, "context_terms");
     let mut jobs = parse_feed(&xml, &source)?;
-    if !context.is_empty() {
-        for job in &mut jobs {
-            job.description = join([job.description.clone(), context.clone()]);
-        }
-    }
+    append_context(&mut jobs, &cfg(config, "context_terms"));
     Ok(jobs)
+}
+
+/// Some feeds carry no useful location or stack wording, so the source config
+/// can staple extra terms onto every description for the matcher to read.
+fn append_context(jobs: &mut [JobLead], context: &str) {
+    if context.is_empty() {
+        return;
+    }
+    for job in jobs {
+        job.description = join([job.description.clone(), context.to_owned()]);
+    }
 }
 
 fn extract_json_ld(html: &str) -> Vec<Value> {
@@ -267,17 +290,7 @@ impl OrElseString for String {
 }
 
 fn generic_html(config: &Value) -> Result<Vec<JobLead>> {
-    let urls: Vec<String> = config
-        .get("start_urls")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_else(|| vec![cfg(config, "url")]);
+    let urls = start_urls(config);
     let source = display_name(config);
     let company = display_name(config);
     let allowed_domains: Vec<String> = config
@@ -321,7 +334,7 @@ fn generic_html(config: &Value) -> Result<Vec<JobLead>> {
         .clamp(1, 60) as usize;
     let mut jobs = vec![];
     let mut links = vec![];
-    for url in urls.into_iter().filter(|url| !url.is_empty()).take(10) {
+    for url in urls {
         let html = fetch_text(client()?.get(&url))?;
         let mut nodes = vec![];
         for payload in extract_json_ld(&html) {
@@ -331,23 +344,7 @@ fn generic_html(config: &Value) -> Result<Vec<JobLead>> {
             jobs.push(job_from_json_ld(&node, &url, &source, &company));
         }
         for (link, anchor) in extract_anchor_links(&html, &url) {
-            let host_allowed = allowed_domains.is_empty()
-                || Url::parse(&link)
-                    .ok()
-                    .and_then(|url| {
-                        url.host_str()
-                            .map(|host| host.trim_start_matches("www.").to_lowercase())
-                    })
-                    .is_some_and(|host| {
-                        allowed_domains
-                            .iter()
-                            .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
-                    });
-            let searchable = format!("{} {}", link.to_lowercase(), anchor.to_lowercase());
-            if host_allowed
-                && (keywords.iter().any(|keyword| searchable.contains(keyword))
-                    || patterns.iter().any(|pattern| pattern.is_match(&link)))
-            {
+            if is_job_link(&link, &anchor, &allowed_domains, &keywords, &patterns) {
                 links.push(link);
             }
         }
@@ -376,6 +373,53 @@ fn generic_html(config: &Value) -> Result<Vec<JobLead>> {
         }
     }
     Ok(dedupe_jobs(jobs))
+}
+
+/// The pages a generic scrape starts from: "start_urls" if given, otherwise the
+/// single "url". Blank entries are dropped and the list is capped.
+fn start_urls(config: &Value) -> Vec<String> {
+    config
+        .get("start_urls")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_else(|| vec![cfg(config, "url")])
+        .into_iter()
+        .filter(|url| !url.is_empty())
+        .take(10)
+        .collect()
+}
+
+/// An anchor is worth following when its host is allowed and either its text or
+/// its URL looks like a job posting.
+fn is_job_link(
+    link: &str,
+    anchor: &str,
+    allowed_domains: &[String],
+    keywords: &[String],
+    patterns: &[Regex],
+) -> bool {
+    let host_allowed = allowed_domains.is_empty()
+        || Url::parse(link)
+            .ok()
+            .and_then(|url| {
+                url.host_str()
+                    .map(|host| host.trim_start_matches("www.").to_lowercase())
+            })
+            .is_some_and(|host| {
+                allowed_domains
+                    .iter()
+                    .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
+            });
+    let searchable = format!("{} {}", link.to_lowercase(), anchor.to_lowercase());
+    host_allowed
+        && (keywords.iter().any(|keyword| searchable.contains(keyword))
+            || patterns.iter().any(|pattern| pattern.is_match(link)))
 }
 
 fn extract_anchor_links(html: &str, base: &str) -> Vec<(String, String)> {
@@ -477,7 +521,7 @@ fn lever(config: &Value) -> Result<Vec<JobLead>> {
             break;
         };
         jobs.extend(lever_leads(items, config));
-        if items.len() < 100 {
+        if last_page(items.len(), 100) {
             break;
         }
     }
@@ -544,17 +588,10 @@ fn ashby_leads(items: &[Value], config: &Value) -> Vec<JobLead> {
 }
 
 fn workable(config: &Value) -> Result<Vec<JobLead>> {
-    let subdomain = cfg(config, "account_subdomain");
-    let request = if cfg(config, "mode") == "spi" {
-        let variable = cfg(config, "api_token_env");
-        let token = env::var(&variable).map_err(|_| format!("Workable requires {variable}"))?;
-        client()?
-            .get(format!("https://{subdomain}.workable.com/spi/v3/jobs"))
-            .bearer_auth(token)
-    } else {
-        client()?.get(format!(
-            "https://www.workable.com/api/accounts/{subdomain}?details=true"
-        ))
+    let (url, token) = workable_endpoint(config)?;
+    let request = match token {
+        Some(token) => client()?.get(url).bearer_auth(token),
+        None => client()?.get(url),
     };
     let payload = fetch_json(request)?;
     let items = payload
@@ -612,7 +649,7 @@ fn adzuna(config: &Value) -> Result<Vec<JobLead>> {
         ]))?;
         let items = array(&payload, "results");
         jobs.extend(adzuna_leads(items, config, &country));
-        if items.len() < 50 {
+        if last_page(items.len(), 50) {
             break;
         }
     }
@@ -868,6 +905,29 @@ fn format_salary(
     }
 }
 
+/// A page returning fewer rows than it was asked for is the last one.
+fn last_page(returned: usize, page_size: usize) -> bool {
+    returned < page_size
+}
+
+/// The authenticated SPI endpoint when the source is configured for it, and the
+/// public account endpoint otherwise. `Some(token)` means send bearer auth.
+fn workable_endpoint(config: &Value) -> Result<(String, Option<String>)> {
+    let subdomain = cfg(config, "account_subdomain");
+    if cfg(config, "mode") != "spi" {
+        return Ok((
+            format!("https://www.workable.com/api/accounts/{subdomain}?details=true"),
+            None,
+        ));
+    }
+    let variable = cfg(config, "api_token_env");
+    let token = env::var(&variable).map_err(|_| format!("Workable requires {variable}"))?;
+    Ok((
+        format!("https://{subdomain}.workable.com/spi/v3/jobs"),
+        Some(token),
+    ))
+}
+
 fn dedupe_jobs(jobs: Vec<JobLead>) -> Vec<JobLead> {
     let mut links = HashSet::new();
     jobs.into_iter()
@@ -1051,6 +1111,7 @@ mod tests {
 
     #[test]
     fn required_env_rejects_missing_and_blank_values() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: single-threaded test, no worker threads are running.
         unsafe {
             env::set_var("ROLEFORGE_TEST_SET", "value");
@@ -1575,6 +1636,224 @@ mod tests {
                 employment_type: "full_time".into(),
                 date_posted: "2026-01-01".into(),
             }
+        );
+    }
+
+    // --- dispatch and scraping helpers -----------------------------------
+
+    #[test]
+    fn routes_each_platform_and_type_to_its_adapter() {
+        let routed = |config: Value| adapter(&config);
+        let same = |a: Adapter, b: Adapter| std::ptr::fn_addr_eq(a, b);
+
+        assert!(same(
+            routed(json!({"platform": "greenhouse"})),
+            greenhouse as Adapter
+        ));
+        assert!(same(routed(json!({"platform": "lever"})), lever as Adapter));
+        assert!(same(routed(json!({"platform": "ashby"})), ashby as Adapter));
+        assert!(same(
+            routed(json!({"platform": "workable"})),
+            workable as Adapter
+        ));
+        assert!(same(
+            routed(json!({"platform": "generic_html"})),
+            generic_html as Adapter
+        ));
+
+        assert!(same(
+            routed(json!({"type": "efc_html"})),
+            generic_html as Adapter
+        ));
+        assert!(same(routed(json!({"type": "adzuna"})), adzuna as Adapter));
+        assert!(same(routed(json!({"type": "reed"})), reed as Adapter));
+        assert!(same(routed(json!({"type": "jooble"})), jooble as Adapter));
+        assert!(same(routed(json!({"type": "themuse"})), themuse as Adapter));
+        assert!(same(
+            routed(json!({"type": "arbeitnow"})),
+            arbeitnow as Adapter
+        ));
+        assert!(same(
+            routed(json!({"type": "remotive"})),
+            remotive as Adapter
+        ));
+
+        // Unknown, absent, or feed-shaped sources fall back to RSS.
+        assert!(same(routed(json!({})), rss as Adapter));
+        assert!(same(routed(json!({"platform": "myspace"})), rss as Adapter));
+        assert!(same(routed(json!({"type": "myspace"})), rss as Adapter));
+        // "platform" is consulted before "type".
+        assert!(same(
+            routed(json!({"platform": "lever", "type": "adzuna"})),
+            lever as Adapter
+        ));
+    }
+
+    #[test]
+    fn appends_context_terms_to_every_description() {
+        let mut jobs = vec![
+            JobLead {
+                description: "<p>Original</p>".into(),
+                ..JobLead::default()
+            },
+            JobLead::default(),
+        ];
+        append_context(&mut jobs, "london hybrid");
+        assert_eq!(jobs[0].description, "Original london hybrid");
+        assert_eq!(jobs[1].description, "london hybrid");
+
+        // No context leaves the descriptions exactly as they were.
+        let mut untouched = vec![JobLead {
+            description: "<p>Original</p>".into(),
+            ..JobLead::default()
+        }];
+        append_context(&mut untouched, "");
+        assert_eq!(untouched[0].description, "<p>Original</p>");
+    }
+
+    #[test]
+    fn start_urls_prefers_the_list_and_drops_blanks() {
+        assert_eq!(
+            start_urls(&json!({"start_urls": ["https://a", "", "https://b"]})),
+            ["https://a", "https://b"]
+        );
+        assert_eq!(start_urls(&json!({"url": "https://c"})), ["https://c"]);
+        assert!(start_urls(&json!({})).is_empty());
+        assert!(start_urls(&json!({"url": ""})).is_empty());
+        // Non-string entries are skipped and the list is capped at ten.
+        let many: Vec<Value> = (0..12).map(|i| json!(format!("https://{i}"))).collect();
+        assert_eq!(start_urls(&json!({"start_urls": many})).len(), 10);
+    }
+
+    #[test]
+    fn job_links_need_an_allowed_host_and_a_matching_keyword() {
+        let keywords = ["careers".to_owned()];
+        let domains = ["example.com".to_owned()];
+        let patterns = vec![Regex::new(r"/vacancy/\d+").unwrap()];
+
+        // Keyword in the URL, allowed host.
+        assert!(is_job_link(
+            "https://example.com/careers/1",
+            "Apply",
+            &domains,
+            &keywords,
+            &[]
+        ));
+        // Keyword in the anchor text instead.
+        assert!(is_job_link(
+            "https://example.com/x/1",
+            "Careers page",
+            &domains,
+            &keywords,
+            &[]
+        ));
+        // Neither: the regex list is the last chance.
+        assert!(!is_job_link(
+            "https://example.com/x/1",
+            "Apply",
+            &domains,
+            &keywords,
+            &[]
+        ));
+        assert!(is_job_link(
+            "https://example.com/vacancy/12",
+            "Apply",
+            &domains,
+            &keywords,
+            &patterns
+        ));
+
+        // Host rules: subdomains and a www. prefix count, other hosts do not.
+        assert!(is_job_link(
+            "https://jobs.example.com/careers/1",
+            "",
+            &domains,
+            &keywords,
+            &[]
+        ));
+        assert!(is_job_link(
+            "https://www.example.com/careers/1",
+            "",
+            &domains,
+            &keywords,
+            &[]
+        ));
+        assert!(!is_job_link(
+            "https://notexample.com/careers/1",
+            "",
+            &domains,
+            &keywords,
+            &[]
+        ));
+        assert!(!is_job_link(
+            "not a url",
+            "careers",
+            &domains,
+            &keywords,
+            &[]
+        ));
+        // No allowed_domains means any host is fine.
+        assert!(is_job_link(
+            "https://anywhere.test/careers/1",
+            "",
+            &[],
+            &keywords,
+            &[]
+        ));
+        // An allowed host with nothing job-shaped about it is still rejected.
+        assert!(!is_job_link(
+            "https://example.com/about",
+            "About us",
+            &domains,
+            &keywords,
+            &[]
+        ));
+    }
+
+    #[test]
+    fn pagination_stops_on_a_short_page() {
+        assert!(last_page(0, 100));
+        assert!(last_page(99, 100));
+        assert!(!last_page(100, 100));
+        assert!(!last_page(101, 100));
+    }
+
+    #[test]
+    fn workable_endpoint_switches_on_the_configured_mode() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: the lock keeps every environment-mutating test serialized.
+        unsafe {
+            env::set_var("ROLEFORGE_WORKABLE_TOKEN", "secret");
+            env::remove_var("ROLEFORGE_WORKABLE_MISSING");
+        }
+        let public = json!({"account_subdomain": "acme"});
+        assert_eq!(
+            workable_endpoint(&public).unwrap(),
+            (
+                "https://www.workable.com/api/accounts/acme?details=true".to_owned(),
+                None
+            )
+        );
+
+        let spi = json!({
+            "account_subdomain": "acme", "mode": "spi",
+            "api_token_env": "ROLEFORGE_WORKABLE_TOKEN"
+        });
+        assert_eq!(
+            workable_endpoint(&spi).unwrap(),
+            (
+                "https://acme.workable.com/spi/v3/jobs".to_owned(),
+                Some("secret".to_owned())
+            )
+        );
+
+        let missing = json!({
+            "account_subdomain": "acme", "mode": "spi",
+            "api_token_env": "ROLEFORGE_WORKABLE_MISSING"
+        });
+        assert_eq!(
+            workable_endpoint(&missing).unwrap_err().to_string(),
+            "Workable requires ROLEFORGE_WORKABLE_MISSING"
         );
     }
 }

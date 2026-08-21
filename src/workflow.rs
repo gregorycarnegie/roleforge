@@ -1,7 +1,7 @@
 use crate::Result;
 use crate::config::{self, BORDERLINE_MARGIN, MIN_MATCH_SCORE, STATE_DB};
 use crate::matching::score_job;
-use crate::model::string;
+use crate::model::{ResumeProfile, string};
 use crate::sources;
 use crate::storage::{self, Database, FeedState, JobRow};
 use crate::telegram;
@@ -43,16 +43,7 @@ pub fn pull() -> Result<()> {
         "europe",
         "americas",
     ];
-    let lockouts: Vec<String> = regions
-        .iter()
-        .filter(|region| {
-            !profile
-                .preferred_locations
-                .iter()
-                .any(|item| item == **region)
-        })
-        .flat_map(|region| [format!("{region} only"), format!("remote {region}")])
-        .collect();
+    let lockouts = lockouts(&regions, &profile);
     let mut matches = vec![];
     let mut borderline = vec![];
     let mut new_rows = vec![];
@@ -63,30 +54,10 @@ pub fn pull() -> Result<()> {
         if name.is_empty() {
             continue;
         }
-        let interval = source
-            .get("min_interval_seconds")
-            .and_then(Value::as_f64)
-            .or_else(|| {
-                source
-                    .get("min_interval_seconds")
-                    .and_then(Value::as_i64)
-                    .map(|v| v as f64)
-            })
-            .unwrap_or(3600.0);
-        if state
-            .get(&name)
-            .is_some_and(|value| now - value.last_checked_at < interval)
-        {
+        if !feed_due(state.get(&name), now, feed_interval(&source)) {
             continue;
         }
-        let label = {
-            let display = string(source.get("display_name"));
-            if display.is_empty() {
-                name.clone()
-            } else {
-                display
-            }
-        };
+        let label = source_label(&source, &name);
         match sources::fetch(&source) {
             Ok(items) => {
                 state.insert(
@@ -99,10 +70,7 @@ pub fn pull() -> Result<()> {
                 for item in items {
                     let fingerprints =
                         review_fingerprints(&item.title, &item.description, &item.link);
-                    if item.link.is_empty()
-                        || links.contains(&item.link)
-                        || db.has_reviewed(&fingerprints)?
-                    {
+                    if already_seen(&item.link, &links) || db.has_reviewed(&fingerprints)? {
                         continue;
                     }
                     let result = score_job(&item, &label, &profile, &search, &timestamp, &lockouts);
@@ -124,27 +92,19 @@ pub fn pull() -> Result<()> {
                                 lead: item.clone(),
                             });
                             links.insert(item.link);
-                        } else if result.score >= MIN_MATCH_SCORE - BORDERLINE_MARGIN {
+                        } else if is_borderline(result.score) {
                             borderline.push(candidate);
                         }
                     }
                 }
             }
             Err(error) => {
-                let failures = state
-                    .get(&name)
-                    .map_or(1, |value| value.consecutive_failures + 1);
-                state.insert(
-                    name.clone(),
-                    FeedState {
-                        last_checked_at: state.get(&name).map_or(0.0, |v| v.last_checked_at),
-                        consecutive_failures: failures,
-                    },
-                );
+                let failed = after_failure(state.get(&name));
                 warn!("skipping {label}: {error}");
-                if failures == 10 {
-                    matches.push(json!({"time":timestamp,"title":format!("⚠️ Source Failure: {label}"),"description":format!("The job source '{label}' failed 10 times consecutively."),"link":"https://github.com/gregorycarnegie/roleforge","source":"System Monitor","company":"","qualified":true,"score":100,"reasons":["Source failed 10 times consecutively"]}));
+                if let Some(alert) = source_failure_alert(&label, &timestamp, &failed) {
+                    matches.push(alert);
                 }
+                state.insert(name.clone(), failed);
             }
         }
     }
@@ -328,13 +288,35 @@ pub fn export_latest() -> Result<()> {
                 .as_str()
                 .map(str::to_owned)
         });
-    if timestamp != current && timestamp.is_some() {
-        storage::write_json("desc.json", &Value::Array(rows))?;
-        info!("staged latest matched batch");
-    } else if timestamp.is_none() && !Path::new("desc.json").exists() {
-        storage::write_json("desc.json", &json!([]))?;
+    match export_action(timestamp.as_deref(), current.as_deref(), || {
+        Path::new("desc.json").exists()
+    }) {
+        Export::Batch => {
+            storage::write_json("desc.json", &Value::Array(rows))?;
+            info!("staged latest matched batch");
+        }
+        Export::Empty => storage::write_json("desc.json", &json!([]))?,
+        Export::Skip => {}
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Export {
+    /// The newest batch has not been staged yet.
+    Batch,
+    /// Nothing has ever been collected and there is no file to leave alone.
+    Empty,
+    Skip,
+}
+
+fn export_action(latest: Option<&str>, staged: Option<&str>, exists: impl Fn() -> bool) -> Export {
+    match latest {
+        Some(latest) if Some(latest) != staged => Export::Batch,
+        Some(_) => Export::Skip,
+        None if !exists() => Export::Empty,
+        None => Export::Skip,
+    }
 }
 
 pub fn worker() -> Result<()> {
@@ -365,6 +347,73 @@ pub fn run() -> Result<()> {
         }
         thread::sleep(Duration::from_secs(60));
     }
+}
+
+/// Region phrases the candidate has not asked for. A posting carrying one is
+/// restricted to somewhere they cannot work.
+fn lockouts(regions: &[&str], profile: &ResumeProfile) -> Vec<String> {
+    regions
+        .iter()
+        .filter(|region| {
+            !profile
+                .preferred_locations
+                .iter()
+                .any(|item| item == **region)
+        })
+        .flat_map(|region| [format!("{region} only"), format!("remote {region}")])
+        .collect()
+}
+
+/// Sources may state their polling interval as either JSON number type.
+fn feed_interval(source: &Value) -> f64 {
+    source
+        .get("min_interval_seconds")
+        .and_then(|value| {
+            value
+                .as_f64()
+                .or_else(|| value.as_i64().map(|seconds| seconds as f64))
+        })
+        .unwrap_or(3600.0)
+}
+
+/// A feed never polled before is always due.
+fn feed_due(state: Option<&FeedState>, now: f64, interval: f64) -> bool {
+    state.is_none_or(|value| now - value.last_checked_at >= interval)
+}
+
+fn source_label(source: &Value, name: &str) -> String {
+    let display = string(source.get("display_name"));
+    if display.is_empty() {
+        name.to_owned()
+    } else {
+        display
+    }
+}
+
+/// Linkless leads cannot be deduplicated or applied to, and a link already in
+/// this run has been scored already.
+fn already_seen(link: &str, links: &HashSet<String>) -> bool {
+    link.is_empty() || links.contains(link)
+}
+
+/// Just short of the bar: worth recording for review, not worth alerting on.
+fn is_borderline(score: i64) -> bool {
+    score >= MIN_MATCH_SCORE - BORDERLINE_MARGIN
+}
+
+fn after_failure(previous: Option<&FeedState>) -> FeedState {
+    FeedState {
+        last_checked_at: previous.map_or(0.0, |value| value.last_checked_at),
+        consecutive_failures: previous.map_or(1, |value| value.consecutive_failures + 1),
+    }
+}
+
+/// Alert once, on the tenth consecutive failure, so a dead source is noticed
+/// without alerting on every poll afterwards.
+fn source_failure_alert(label: &str, timestamp: &str, state: &FeedState) -> Option<Value> {
+    (state.consecutive_failures == 10).then(|| {
+        json!({"time":timestamp,"title":format!("⚠️ Source Failure: {label}"),"description":format!("The job source '{label}' failed 10 times consecutively."),"link":"https://github.com/gregorycarnegie/roleforge","source":"System Monitor","company":"","qualified":true,"score":100,"reasons":["Source failed 10 times consecutively"]})
+    })
 }
 
 pub fn digest_due(config: &Value, last_date: &str) -> bool {
@@ -470,5 +519,118 @@ mod tests {
         assert!(!digest_due(&json!({"hour_utc": 0}), &today));
         // Defaults: enabled, and the 07:00 hour, so only the date is asserted.
         assert!(!digest_due(&json!({}), &today));
+    }
+
+    #[test]
+    fn lockouts_cover_every_region_not_asked_for() {
+        let profile = ResumeProfile {
+            preferred_locations: vec!["uk".into(), "europe".into()],
+            ..ResumeProfile::default()
+        };
+        assert_eq!(
+            lockouts(&["uk", "us", "europe"], &profile),
+            ["us only", "remote us"]
+        );
+        // Nothing preferred means everything is a lockout.
+        assert_eq!(
+            lockouts(&["us"], &ResumeProfile::default()),
+            ["us only", "remote us"]
+        );
+        assert!(lockouts(&[], &profile).is_empty());
+    }
+
+    #[test]
+    fn feed_interval_accepts_either_json_number_type() {
+        assert_eq!(feed_interval(&json!({"min_interval_seconds": 900})), 900.0);
+        assert_eq!(
+            feed_interval(&json!({"min_interval_seconds": 900.5})),
+            900.5
+        );
+        assert_eq!(
+            feed_interval(&json!({"min_interval_seconds": "900"})),
+            3600.0
+        );
+        assert_eq!(feed_interval(&json!({})), 3600.0);
+    }
+
+    #[test]
+    fn feeds_are_due_once_the_interval_has_fully_elapsed() {
+        let checked = |seconds| FeedState {
+            last_checked_at: seconds,
+            consecutive_failures: 0,
+        };
+        // Never polled.
+        assert!(feed_due(None, 1_000.0, 900.0));
+        // Exactly at the interval counts as due.
+        assert!(feed_due(Some(&checked(100.0)), 1_000.0, 900.0));
+        assert!(feed_due(Some(&checked(0.0)), 1_000.0, 900.0));
+        assert!(!feed_due(Some(&checked(101.0)), 1_000.0, 900.0));
+        assert!(!feed_due(Some(&checked(1_000.0)), 1_000.0, 900.0));
+    }
+
+    #[test]
+    fn source_label_falls_back_to_the_name() {
+        assert_eq!(
+            source_label(&json!({"display_name": "We Work Remotely"}), "wwr"),
+            "We Work Remotely"
+        );
+        assert_eq!(source_label(&json!({"display_name": ""}), "wwr"), "wwr");
+        assert_eq!(source_label(&json!({}), "wwr"), "wwr");
+    }
+
+    #[test]
+    fn already_seen_covers_blank_and_repeated_links() {
+        let links = HashSet::from(["https://example/1".to_owned()]);
+        assert!(already_seen("", &links));
+        assert!(already_seen("https://example/1", &links));
+        assert!(!already_seen("https://example/2", &links));
+        assert!(!already_seen("https://example/2", &HashSet::new()));
+    }
+
+    #[test]
+    fn borderline_starts_one_margin_below_the_match_score() {
+        assert!(is_borderline(MIN_MATCH_SCORE));
+        assert!(is_borderline(MIN_MATCH_SCORE - BORDERLINE_MARGIN));
+        assert!(!is_borderline(MIN_MATCH_SCORE - BORDERLINE_MARGIN - 1));
+        assert!(!is_borderline(0));
+    }
+
+    #[test]
+    fn failures_accumulate_and_alert_exactly_once() {
+        let first = after_failure(None);
+        assert_eq!(first.consecutive_failures, 1);
+        assert_eq!(first.last_checked_at, 0.0);
+
+        // A failure does not count as a successful poll, so the timestamp holds.
+        let previous = FeedState {
+            last_checked_at: 1_234.5,
+            consecutive_failures: 8,
+        };
+        let next = after_failure(Some(&previous));
+        assert_eq!(next.consecutive_failures, 9);
+        assert_eq!(next.last_checked_at, 1_234.5);
+
+        assert!(source_failure_alert("wwr", "t", &next).is_none());
+        let tenth = after_failure(Some(&next));
+        assert_eq!(tenth.consecutive_failures, 10);
+        let alert = source_failure_alert("wwr", "t", &tenth).unwrap();
+        assert_eq!(alert["title"], "⚠️ Source Failure: wwr");
+        assert_eq!(alert["time"], "t");
+        assert_eq!(alert["score"], 100);
+        assert_eq!(alert["qualified"], true);
+        // Silent again afterwards.
+        assert!(source_failure_alert("wwr", "t", &after_failure(Some(&tenth))).is_none());
+    }
+
+    #[test]
+    fn export_writes_only_a_batch_that_is_not_already_staged() {
+        let never = || panic!("existence must not be checked when a batch exists");
+        assert_eq!(export_action(Some("t2"), Some("t1"), never), Export::Batch);
+        assert_eq!(export_action(Some("t1"), None, never), Export::Batch);
+        assert_eq!(export_action(Some("t1"), Some("t1"), never), Export::Skip);
+        // Nothing collected yet: seed an empty file, but never clobber one.
+        assert_eq!(export_action(None, None, || false), Export::Empty);
+        assert_eq!(export_action(None, None, || true), Export::Skip);
+        assert_eq!(export_action(None, Some("t1"), || true), Export::Skip);
     }
 }

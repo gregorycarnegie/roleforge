@@ -106,14 +106,23 @@ pub fn send_message(message: &str, markup: Option<Value>) -> Result<Value> {
     if token.is_empty() || chat_id.is_empty() {
         return Err("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be configured".into());
     }
+    request(
+        &token,
+        "sendMessage",
+        &message_payload(&chat_id, &thread_id, message, markup),
+        20,
+    )
+}
+
+fn message_payload(chat_id: &str, thread_id: &str, message: &str, markup: Option<Value>) -> Value {
     let mut payload = json!({"chat_id":chat_id,"text":message,"disable_web_page_preview":true});
     if !thread_id.is_empty() {
-        payload["message_thread_id"] = Value::String(thread_id);
+        payload["message_thread_id"] = Value::String(thread_id.into());
     }
     if let Some(markup) = markup {
         payload["reply_markup"] = markup;
     }
-    request(&token, "sendMessage", &payload, 20)
+    payload
 }
 
 fn edit_message(
@@ -433,5 +442,69 @@ mod tests {
         let mut state = json!({"pending_alerts": [], "alerted_links": []});
         assert_eq!(deliver_alerts(&mut state, "t"), (0, String::new()));
         assert!(state.get("last_delivery_utc").is_none());
+    }
+
+    #[test]
+    fn settings_read_the_three_environment_variables() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: single-threaded test, no worker threads are running.
+        unsafe {
+            env::set_var("TELEGRAM_BOT_TOKEN", "  token  ");
+            env::set_var("TELEGRAM_CHAT_ID", " chat ");
+            env::set_var("TELEGRAM_THREAD_ID", " 7 ");
+        }
+        assert_eq!(
+            settings(),
+            ("token".to_owned(), "chat".to_owned(), "7".to_owned())
+        );
+
+        unsafe {
+            env::remove_var("TELEGRAM_BOT_TOKEN");
+            env::remove_var("TELEGRAM_CHAT_ID");
+            env::remove_var("TELEGRAM_THREAD_ID");
+        }
+        assert_eq!(settings(), (String::new(), String::new(), String::new()));
+
+        // Credentials are required before anything is sent.
+        assert_eq!(
+            send_message("hello", None).unwrap_err().to_string(),
+            "TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be configured"
+        );
+        unsafe { env::set_var("TELEGRAM_CHAT_ID", "chat") };
+        assert_eq!(
+            send_message("hello", None).unwrap_err().to_string(),
+            "TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be configured"
+        );
+        unsafe {
+            env::remove_var("TELEGRAM_CHAT_ID");
+        }
+    }
+
+    #[test]
+    fn message_payload_carries_the_thread_and_markup_only_when_present() {
+        assert_eq!(
+            message_payload("chat", "", "hello", None),
+            json!({"chat_id": "chat", "text": "hello", "disable_web_page_preview": true})
+        );
+        assert_eq!(
+            message_payload("chat", "7", "hello", Some(json!({"inline_keyboard": []}))),
+            json!({
+                "chat_id": "chat", "text": "hello", "disable_web_page_preview": true,
+                "message_thread_id": "7", "reply_markup": {"inline_keyboard": []}
+            })
+        );
+    }
+
+    #[test]
+    fn polling_needs_a_configured_token() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: the lock keeps every environment-mutating test serialized.
+        unsafe { env::remove_var("TELEGRAM_BOT_TOKEN") };
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("state.sqlite3")).unwrap();
+        assert_eq!(
+            process_updates(&db, 25).unwrap_err().to_string(),
+            "TELEGRAM_BOT_TOKEN not configured"
+        );
     }
 }

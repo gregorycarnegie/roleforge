@@ -20,6 +20,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 ### Changed
 
 - Split each provider adapter's payload mapping out of its HTTP call so the mapping is testable.
+- Extracted the pure decisions inside `pull`, `export_latest`, `generic_html`, and `send_message` into named helpers.
+- Replaced the two nested `match` statements dispatching sources with a lookup table.
 - Dropped a completeness check in `parse_feed` that `dedupe_jobs` already applies.
 - Updated the Rust dependency set to its latest compatible releases.
 - Adapted Reqwest configuration for its `rustls` and `query` features.

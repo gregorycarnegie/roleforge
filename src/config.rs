@@ -480,6 +480,7 @@ mod tests {
 
     #[test]
     fn dotenv_sets_only_unset_keys() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         // SAFETY: single-threaded test, no worker threads are running.
         unsafe {
