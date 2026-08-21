@@ -375,3 +375,100 @@ pub fn digest_due(config: &Value, last_date: &str) -> bool {
         && Utc::now().hour() >= config.get("hour_utc").and_then(Value::as_u64).unwrap_or(7) as u32
         && Utc::now().date_naive().to_string() != last_date
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn application(link: &str, status: &str, score: i64, shortlisted: bool) -> Value {
+        json!({"link": link, "status": status, "score": score, "shortlisted": shortlisted})
+    }
+
+    #[test]
+    fn digest_ranks_shortlisted_first_then_score() {
+        let applications = json!({
+            "applications": [
+                application("a", "new", 90, false),
+                application("b", "new", 40, true),
+                application("c", "new", 95, false),
+                application("d", "new", 60, true),
+            ]
+        });
+        let digest = build_digest(&applications, &json!({}), "2026-01-01T00:00:00Z");
+        assert_eq!(digest["generated_at_utc"], "2026-01-01T00:00:00Z");
+        assert_eq!(digest["count"], 4);
+        assert_eq!(
+            digest["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["link"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["d", "b", "c", "a"]
+        );
+    }
+
+    #[test]
+    fn digest_filters_by_status_and_caps_the_item_count() {
+        let applications = json!({
+            "applications": [
+                application("a", "new", 90, false),
+                application("b", "archived", 95, false),
+                application("c", "applied", 80, false),
+                json!({"link": "d", "score": 70}),
+            ]
+        });
+        let filtered = build_digest(
+            &applications,
+            &json!({"include_statuses": ["new", "applied"]}),
+            "t",
+        );
+        // A record with no status counts as "new".
+        assert_eq!(
+            filtered["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["link"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["a", "c", "d"]
+        );
+
+        let capped = build_digest(&applications, &json!({"max_items": 2}), "t");
+        assert_eq!(capped["count"], 2);
+        assert_eq!(capped["items"][0]["link"], "b");
+
+        // An empty status list means no filtering at all.
+        let unfiltered = build_digest(&applications, &json!({"include_statuses": []}), "t");
+        assert_eq!(unfiltered["count"], 4);
+
+        // The default cap is eight.
+        let many = json!({
+            "applications": (0..12).map(|i| application(&i.to_string(), "new", i, false))
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(build_digest(&many, &json!({}), "t")["count"], 8);
+    }
+
+    #[test]
+    fn digest_of_nothing_is_empty() {
+        let digest = build_digest(&json!({}), &json!({}), "t");
+        assert_eq!(digest["count"], 0);
+        assert_eq!(digest["items"], json!([]));
+    }
+
+    #[test]
+    fn digest_due_needs_enabled_the_hour_and_a_new_day() {
+        let today = Utc::now().date_naive().to_string();
+
+        // hour_utc 0 is always reached; hour_utc 24 never is.
+        assert!(digest_due(&json!({"hour_utc": 0}), ""));
+        assert!(!digest_due(&json!({"hour_utc": 24}), ""));
+        assert!(!digest_due(&json!({"enabled": false, "hour_utc": 0}), ""));
+        assert!(digest_due(&json!({"enabled": true, "hour_utc": 0}), ""));
+        // Already sent today.
+        assert!(!digest_due(&json!({"hour_utc": 0}), &today));
+        // Defaults: enabled, and the 07:00 hour, so only the date is asserted.
+        assert!(!digest_due(&json!({}), &today));
+    }
+}

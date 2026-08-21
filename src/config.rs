@@ -283,10 +283,33 @@ pub fn load_company_boards(path: impl AsRef<Path>) -> Result<Vec<Value>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write(dir: &tempfile::TempDir, name: &str, body: &str) -> std::path::PathBuf {
+        let path = dir.path().join(name);
+        fs::write(&path, body).unwrap();
+        path
+    }
+
     #[test]
     fn defaults_are_operational() {
         assert_eq!(built_in_sources().len(), 18);
         assert_eq!(default_role_profiles().len(), 3);
+        assert!(
+            built_in_sources()
+                .iter()
+                .all(|source| source.get("name").is_some_and(Value::is_string))
+        );
+        assert!(
+            default_role_profiles()
+                .iter()
+                .all(|role| !role.title_keywords.is_empty() && role.title_boost > 0)
+        );
+    }
+
+    #[test]
+    fn words_maps_every_entry() {
+        assert_eq!(words(&["one", "two"]), ["one", "two"]);
+        assert!(words(&[]).is_empty());
     }
 
     #[test]
@@ -294,5 +317,196 @@ mod tests {
         let profile = load_resume("resume.example.json").unwrap();
         assert_eq!(profile.candidate_name, "Alex Example");
         assert!(!profile.target_roles.is_empty());
+    }
+
+    #[test]
+    fn load_resume_reads_every_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            &dir,
+            "resume.json",
+            r#"{
+                "summary": "Support specialist",
+                "personal_info": {
+                    "name": "Alex", "title": "Engineer",
+                    "target_roles": ["it support engineer", "  ", "service desk"],
+                    "location": {"city": "London", "country": "UK"},
+                    "preferences": {
+                        "remote": true, "hybrid": true, "onsite": false, "relocation": true,
+                        "minimum_salary_gbp": 42000,
+                        "preferred_locations": ["Greater London"]
+                    }
+                },
+                "technical_skills": {"skills": ["Intune"], "competencies": ["Coaching"]},
+                "experience": [
+                    {"title": "Engineer", "company": "Acme",
+                     "responsibilities": ["Ran the estate", "Fixed things"]},
+                    {"title": "Intern", "company": "Globex"}
+                ]
+            }"#,
+        );
+        let profile = load_resume(&path).unwrap();
+        assert_eq!(profile.candidate_name, "Alex");
+        assert_eq!(profile.candidate_title, "Engineer");
+        assert_eq!(profile.resume_summary, "Support specialist");
+        assert!(profile.remote && profile.hybrid && profile.relocation);
+        assert!(!profile.onsite);
+        assert_eq!(profile.minimum_salary_gbp, 42_000);
+        // Preferences, then city and country, normalized and deduplicated.
+        assert_eq!(
+            profile.preferred_locations,
+            ["greater london", "london", "uk"]
+        );
+        assert_eq!(
+            profile.target_roles,
+            ["it support engineer", "service desk"]
+        );
+        assert_eq!(profile.skills, ["Intune"]);
+        assert_eq!(profile.competencies, ["Coaching"]);
+        // The summary, then only experience entries with responsibilities.
+        assert_eq!(
+            profile.evidence,
+            [
+                ("Summary".to_owned(), "Support specialist".to_owned()),
+                (
+                    "Engineer at Acme".to_owned(),
+                    "Ran the estate Fixed things".to_owned()
+                )
+            ]
+        );
+        assert_eq!(profile.raw["personal_info"]["name"], "Alex");
+    }
+
+    #[test]
+    fn load_resume_tolerates_an_empty_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = load_resume(write(&dir, "bare.json", "{}")).unwrap();
+        assert_eq!(profile.candidate_name, "");
+        assert_eq!(profile.minimum_salary_gbp, 0);
+        assert!(!profile.remote && !profile.hybrid && !profile.onsite && !profile.relocation);
+        assert!(profile.preferred_locations.is_empty());
+        assert!(profile.evidence.is_empty());
+
+        assert!(load_resume(write(&dir, "bad.json", "not json")).is_err());
+        assert!(load_resume(dir.path().join("missing.json")).is_err());
+    }
+
+    #[test]
+    fn search_config_falls_back_to_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = load_search_config(dir.path().join("missing.json")).unwrap();
+        assert!(missing.company_whitelist.is_empty());
+        assert_eq!(missing.role_profiles.len(), 3);
+        assert_eq!(missing.daily_digest["hour_utc"], 7);
+        assert_eq!(missing.feedback["min_samples"], 2);
+
+        // Present but empty: still defaults.
+        let empty = load_search_config(write(&dir, "empty.json", "{}")).unwrap();
+        assert_eq!(empty.role_profiles.len(), 3);
+
+        // A role_profiles array that parses to nothing also falls back.
+        let junk = load_search_config(write(
+            &dir,
+            "junk.json",
+            r#"{"role_profiles": [{"no_name_field": 1}]}"#,
+        ))
+        .unwrap();
+        assert_eq!(junk.role_profiles.len(), 3);
+    }
+
+    #[test]
+    fn search_config_reads_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            &dir,
+            "search.json",
+            r#"{
+                "company_whitelist": ["Acme", "  "],
+                "company_blacklist": ["SpamCorp"],
+                "priority_companies": ["Globex"],
+                "role_profiles": [{"name": "custom", "title_keywords": ["support"],
+                                   "title_boost": 5, "priority": 1}],
+                "daily_digest": {"hour_utc": 19},
+                "feedback": {"enabled": false}
+            }"#,
+        );
+        let config = load_search_config(&path).unwrap();
+        assert_eq!(config.company_whitelist, ["Acme"]);
+        assert_eq!(config.company_blacklist, ["SpamCorp"]);
+        assert_eq!(config.priority_companies, ["Globex"]);
+        assert_eq!(config.role_profiles.len(), 1);
+        assert_eq!(config.role_profiles[0].name, "custom");
+        assert_eq!(config.daily_digest["hour_utc"], 19);
+        assert_eq!(config.feedback["enabled"], false);
+
+        // Non-object daily_digest/feedback keep the defaults.
+        let scalar = load_search_config(write(
+            &dir,
+            "scalar.json",
+            r#"{"daily_digest": 5, "feedback": "on"}"#,
+        ))
+        .unwrap();
+        assert_eq!(scalar.daily_digest["hour_utc"], 7);
+        assert_eq!(scalar.feedback["min_samples"], 2);
+
+        assert!(load_search_config(write(&dir, "bad.json", "{")).is_err());
+    }
+
+    #[test]
+    fn company_boards_are_filtered_to_objects() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            load_company_boards(dir.path().join("missing.json"))
+                .unwrap()
+                .is_empty()
+        );
+        let boards = load_company_boards(write(
+            &dir,
+            "boards.json",
+            r#"[{"name": "acme"}, "skip me", 5, {"name": "globex"}]"#,
+        ))
+        .unwrap();
+        assert_eq!(boards.len(), 2);
+        assert_eq!(boards[0]["name"], "acme");
+        assert_eq!(boards[1]["name"], "globex");
+
+        // A document that is not an array yields nothing.
+        assert!(
+            load_company_boards(write(&dir, "object.json", r#"{"name": "acme"}"#))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn dotenv_sets_only_unset_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: single-threaded test, no worker threads are running.
+        unsafe {
+            env::set_var("ROLEFORGE_DOTENV_EXISTING", "original");
+            env::remove_var("ROLEFORGE_DOTENV_NEW");
+            env::remove_var("ROLEFORGE_DOTENV_QUOTED");
+            env::remove_var("ROLEFORGE_DOTENV_COMMENT");
+        }
+        let path = write(
+            &dir,
+            ".env",
+            "\n  # a comment\n\
+             ROLEFORGE_DOTENV_NEW=fresh\n\
+             ROLEFORGE_DOTENV_EXISTING=ignored\n\
+             ROLEFORGE_DOTENV_QUOTED = \"quoted value\" \n\
+             #ROLEFORGE_DOTENV_COMMENT=nope\n\
+             no equals sign here\n\
+             =blank key\n",
+        );
+        load_dotenv(&path).unwrap();
+        assert_eq!(env::var("ROLEFORGE_DOTENV_NEW").unwrap(), "fresh");
+        assert_eq!(env::var("ROLEFORGE_DOTENV_EXISTING").unwrap(), "original");
+        assert_eq!(env::var("ROLEFORGE_DOTENV_QUOTED").unwrap(), "quoted value");
+        assert!(env::var("ROLEFORGE_DOTENV_COMMENT").is_err());
+        assert!(env::var("#ROLEFORGE_DOTENV_COMMENT").is_err());
+
+        // A missing file is not an error.
+        load_dotenv(dir.path().join("missing.env")).unwrap();
     }
 }

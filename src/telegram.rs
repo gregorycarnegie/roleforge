@@ -304,14 +304,134 @@ pub fn process_updates(db: &Database, timeout: u64) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn parses_callback() {
         assert_eq!(parse_digest_callback("digest:abc:2"), Some(("abc", "2")));
         assert_eq!(parse_digest_callback("wrong:abc:2"), None);
+        assert_eq!(parse_digest_callback("digest:abc"), None);
+        assert_eq!(parse_digest_callback("digest:abc:2:3"), None);
+        assert_eq!(parse_digest_callback("digest::2"), None);
+        assert_eq!(parse_digest_callback("digest:abc:"), None);
     }
+
     #[test]
     fn builds_keyboard() {
         assert!(digest_keyboard("abc", 0, 2).is_some());
         assert!(digest_keyboard("abc", 0, 1).is_none());
+        assert!(digest_keyboard("abc", 0, 0).is_none());
+
+        // First page: Previous is inert, Next moves forward.
+        let first = digest_keyboard("abc", 0, 3).unwrap();
+        let buttons = &first["inline_keyboard"][0];
+        assert_eq!(buttons[0]["callback_data"], "digest:abc:noop");
+        assert_eq!(buttons[1]["text"], "1/3");
+        assert_eq!(buttons[1]["callback_data"], "digest:abc:noop");
+        assert_eq!(buttons[2]["callback_data"], "digest:abc:1");
+
+        // Middle page: both directions live.
+        let middle = digest_keyboard("abc", 1, 3).unwrap();
+        let buttons = &middle["inline_keyboard"][0];
+        assert_eq!(buttons[0]["callback_data"], "digest:abc:0");
+        assert_eq!(buttons[1]["text"], "2/3");
+        assert_eq!(buttons[2]["callback_data"], "digest:abc:2");
+
+        // Last page: Next is inert.
+        let last = digest_keyboard("abc", 2, 3).unwrap();
+        let buttons = &last["inline_keyboard"][0];
+        assert_eq!(buttons[0]["callback_data"], "digest:abc:1");
+        assert_eq!(buttons[2]["callback_data"], "digest:abc:noop");
+    }
+
+    #[test]
+    fn formats_a_full_alert() {
+        let alert = json!({
+            "score": 87,
+            "title": "IT Support Engineer",
+            "company": "Acme Ltd",
+            "shortlisted": true,
+            "company_control": "priority",
+            "role_profile": "IT Support",
+            "source": "wwr",
+            "reasons": ["first reason", "second reason", "third reason"],
+            "link": "https://example.com/jobs/1"
+        });
+        assert_eq!(
+            format_alert(&alert),
+            "Job Match (87): IT Support Engineer\n\
+             Company: Acme Ltd\n\
+             Priority: shortlisted employer\n\
+             Role Profile: IT Support\n\
+             Source: wwr\n\
+             Why: first reason; second reason\n\
+             https://example.com/jobs/1"
+        );
+    }
+
+    #[test]
+    fn alert_omits_absent_and_blank_fields() {
+        assert_eq!(format_alert(&json!({})), "Job Match (0): \n");
+        assert_eq!(
+            format_alert(&json!({
+                "title": "Analyst",
+                "company": "",
+                "role_profile": "",
+                "source": "",
+                "reasons": [],
+                "link": "https://example/1"
+            })),
+            "Job Match (0): Analyst\nhttps://example/1"
+        );
+    }
+
+    #[test]
+    fn whitelist_priority_is_only_shown_when_not_shortlisted() {
+        let base = json!({"title": "Analyst", "company_control": "whitelist", "link": "u"});
+        assert!(format_alert(&base).contains("Priority: company whitelist"));
+
+        let shortlisted = json!({
+            "title": "Analyst", "shortlisted": true, "company_control": "whitelist", "link": "u"
+        });
+        let text = format_alert(&shortlisted);
+        assert!(text.contains("Priority: shortlisted employer"));
+        assert!(!text.contains("company whitelist"));
+
+        let neither = json!({"title": "Analyst", "company_control": "none", "link": "u"});
+        assert!(!format_alert(&neither).contains("Priority:"));
+    }
+
+    #[test]
+    fn queue_alerts_skips_already_alerted_pending_and_linkless_matches() {
+        let mut state = json!({
+            "alerted_links": ["https://example/sent"],
+            "pending_alerts": [{"link": "https://example/queued"}]
+        });
+        let queued = queue_alerts(
+            &mut state,
+            &[
+                json!({"link": "https://example/sent"}),
+                json!({"link": "https://example/queued"}),
+                json!({"link": "", "title": "blank"}),
+                json!({"title": "no link key"}),
+                json!({"link": "https://example/new", "title": "New"}),
+                json!({"link": "https://example/new", "title": "Repeat in this batch"}),
+            ],
+        );
+        assert_eq!(queued, 2);
+        let pending = state["pending_alerts"].as_array().unwrap();
+        assert_eq!(pending.len(), 3);
+        assert_eq!(pending[1]["title"], "New");
+        assert_eq!(pending[2]["title"], "Repeat in this batch");
+
+        // Nothing to add leaves the queue untouched.
+        assert_eq!(queue_alerts(&mut state, &[]), 0);
+        assert_eq!(state["pending_alerts"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn deliver_alerts_is_a_no_op_with_an_empty_queue() {
+        let mut state = json!({"pending_alerts": [], "alerted_links": []});
+        assert_eq!(deliver_alerts(&mut state, "t"), (0, String::new()));
+        assert!(state.get("last_delivery_utc").is_none());
     }
 }

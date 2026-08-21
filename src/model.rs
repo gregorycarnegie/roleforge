@@ -121,3 +121,26 @@ pub fn strings(value: Option<&Value>) -> Vec<String> {
         .map(str::to_owned)
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn json_accessors_tolerate_wrong_shapes() {
+        let value =
+            json!({"name": "  Acme  ", "count": 3, "tags": ["a", "  ", " b "], "empty": []});
+        assert_eq!(string(value.get("name")), "Acme");
+        assert_eq!(string(value.get("count")), "");
+        assert_eq!(string(None), "");
+
+        assert_eq!(object(&value).len(), 4);
+        assert!(object(&json!("scalar")).is_empty());
+
+        assert_eq!(strings(value.get("tags")), ["a", "b"]);
+        assert!(strings(value.get("empty")).is_empty());
+        assert!(strings(value.get("name")).is_empty());
+        assert!(strings(None).is_empty());
+    }
+}

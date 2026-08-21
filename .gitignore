@@ -15,3 +15,5 @@ application_briefs.json
 borderline_matches.json
 feedback_metrics.json
 output.log
+/mutants.out
+/mutants.out.old

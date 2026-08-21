@@ -9,10 +9,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 ### Added
 
 - Property-based tests for link normalization, whitespace cleaning, and truncation limits.
+- A unit-test suite covering matching, scraping, storage, config, and Telegram formatting (16 to 99 tests).
 - A `profiling` build profile and a `find-hotspots` skill for ranking CPU hotspots with samply.
+
+### Fixed
+
+- Honoured explicit geographic lockouts for hybrid and onsite profiles; only remote matches were gated before.
+- Parsed salaries written with thousands separators, so `£45,000 - £55,000` no longer reads as no salary at all.
 
 ### Changed
 
+- Split each provider adapter's payload mapping out of its HTTP call so the mapping is testable.
+- Dropped a completeness check in `parse_feed` that `dedupe_jobs` already applies.
 - Updated the Rust dependency set to its latest compatible releases.
 - Adapted Reqwest configuration for its `rustls` and `query` features.
 - Adapted SHA-256 fingerprint formatting for SHA2 0.11.

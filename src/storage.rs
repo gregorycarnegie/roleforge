@@ -483,20 +483,322 @@ pub fn export_csv(path: impl AsRef<Path>, rows: &[JobRow]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn db() -> (tempfile::TempDir, Database) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("nested").join("roleforge.sqlite3")).unwrap();
+        (dir, db)
+    }
+
+    fn row(time: &str, title: &str, link: &str) -> JobRow {
+        JobRow {
+            time: time.into(),
+            lead: JobLead {
+                title: title.into(),
+                link: link.into(),
+                description: "Description".into(),
+                company: "Acme".into(),
+                location: "London".into(),
+                salary: "£45000".into(),
+                source: "feed".into(),
+                employment_type: "Permanent".into(),
+                date_posted: "2026-01-01".into(),
+            },
+        }
+    }
+
     #[test]
     fn database_round_trip() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut db = Database::open(dir.path().join("roleforge.sqlite3")).unwrap();
-        db.append_jobs(&[JobRow {
-            time: "2026-01-01T00:00:00Z".into(),
-            lead: JobLead {
-                title: "Engineer".into(),
-                link: "https://example/1".into(),
-                ..JobLead::default()
-            },
-        }])
+        let (_dir, mut db) = db();
+        db.append_jobs(&[row("2026-01-01T00:00:00Z", "Engineer", "https://example/1")])
+            .unwrap();
+        let jobs = db.jobs().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].time, "2026-01-01T00:00:00Z");
+        assert_eq!(jobs[0].lead, row("t", "Engineer", "https://example/1").lead);
+    }
+
+    #[test]
+    fn append_jobs_ignores_repeated_links() {
+        let (_dir, mut db) = db();
+        db.append_jobs(&[
+            row("t1", "Engineer", "https://example/1"),
+            row("t1", "Analyst", "https://example/2"),
+        ])
         .unwrap();
-        assert_eq!(db.jobs().unwrap().len(), 1);
-        assert_eq!(db.latest_batch().unwrap().1[0]["title"], "Engineer");
+        db.append_jobs(&[row("t2", "Engineer again", "https://example/1")])
+            .unwrap();
+        let titles: Vec<_> = db
+            .jobs()
+            .unwrap()
+            .into_iter()
+            .map(|job| job.lead.title)
+            .collect();
+        assert_eq!(titles, ["Engineer", "Analyst"]);
+    }
+
+    #[test]
+    fn latest_batch_returns_only_the_newest_timestamp() {
+        let (_dir, mut db) = db();
+        assert_eq!(db.latest_batch().unwrap(), (None, vec![]));
+
+        db.append_jobs(&[
+            row("2026-01-01T00:00:00Z", "Old", "https://example/1"),
+            row("2026-01-02T00:00:00Z", "New", "https://example/2"),
+            row("2026-01-02T00:00:00Z", "Newer", "https://example/3"),
+        ])
+        .unwrap();
+        let (timestamp, items) = db.latest_batch().unwrap();
+        assert_eq!(timestamp.as_deref(), Some("2026-01-02T00:00:00Z"));
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["title"], "New");
+        assert_eq!(items[1]["title"], "Newer");
+        assert_eq!(items[0]["link"], "https://example/2");
+        assert_eq!(items[0]["description"], "Description");
+        assert_eq!(items[0]["time"], "2026-01-02T00:00:00Z");
+    }
+
+    #[test]
+    fn feed_state_round_trips_and_updates_in_place() {
+        let (_dir, mut db) = db();
+        assert!(db.feed_state().unwrap().is_empty());
+
+        let mut state = HashMap::from([(
+            "wwr".to_owned(),
+            FeedState {
+                last_checked_at: 1234.5,
+                consecutive_failures: 2,
+            },
+        )]);
+        db.save_feed_state(&state).unwrap();
+        let loaded = db.feed_state().unwrap();
+        assert_eq!(loaded["wwr"].last_checked_at, 1234.5);
+        assert_eq!(loaded["wwr"].consecutive_failures, 2);
+
+        state.get_mut("wwr").unwrap().consecutive_failures = 0;
+        db.save_feed_state(&state).unwrap();
+        assert_eq!(db.feed_state().unwrap()["wwr"].consecutive_failures, 0);
+        assert_eq!(db.feed_state().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn reviewed_fingerprints_are_recorded_and_trimmed_oldest_first() {
+        let (_dir, mut db) = db();
+        assert!(!db.has_reviewed(&["a".into()]).unwrap());
+        assert!(!db.has_reviewed(&[]).unwrap());
+
+        db.append_reviewed(&["a".into(), "b".into()], 10).unwrap();
+        assert!(db.has_reviewed(&["a".into()]).unwrap());
+        assert!(db.has_reviewed(&["zzz".into(), "b".into()]).unwrap());
+        assert!(!db.has_reviewed(&["zzz".into()]).unwrap());
+
+        // Re-inserting an existing fingerprint must not advance the position,
+        // or the trim below would drop the wrong rows.
+        db.append_reviewed(&["a".into(), "c".into()], 2).unwrap();
+        assert!(!db.has_reviewed(&["a".into()]).unwrap());
+        assert!(db.has_reviewed(&["b".into()]).unwrap());
+        assert!(db.has_reviewed(&["c".into()]).unwrap());
+    }
+
+    #[test]
+    fn alert_state_round_trips_links_pending_and_metadata() {
+        let (_dir, mut db) = db();
+        let empty = db.alert_state().unwrap();
+        assert_eq!(empty["alerted_links"], json!([]));
+        assert_eq!(empty["pending_alerts"], json!([]));
+        assert_eq!(empty["last_run_utc"], "");
+
+        db.save_alert_state(&json!({
+            "alerted_links": ["https://example/1", "https://example/2"],
+            "pending_alerts": [
+                {"link": "https://example/3", "score": 40},
+                {"score": 10}
+            ],
+            "last_run_utc": "2026-01-01T00:00:00Z",
+            "last_delivery_utc": "2026-01-01T00:05:00Z",
+            "last_delivery_error": "rate limited"
+        }))
+        .unwrap();
+
+        let state = db.alert_state().unwrap();
+        assert_eq!(
+            state["alerted_links"],
+            json!(["https://example/1", "https://example/2"])
+        );
+        // A pending alert with no link is dropped.
+        assert_eq!(state["pending_alerts"].as_array().unwrap().len(), 1);
+        assert_eq!(state["pending_alerts"][0]["score"], 40);
+        assert_eq!(state["last_run_utc"], "2026-01-01T00:00:00Z");
+        assert_eq!(state["last_delivery_utc"], "2026-01-01T00:05:00Z");
+        assert_eq!(state["last_delivery_error"], "rate limited");
+
+        // Saving again replaces rather than appends, and clears absent metadata.
+        db.save_alert_state(&json!({"alerted_links": ["https://example/9"]}))
+            .unwrap();
+        let state = db.alert_state().unwrap();
+        assert_eq!(state["alerted_links"], json!(["https://example/9"]));
+        assert_eq!(state["pending_alerts"], json!([]));
+        assert_eq!(state["last_delivery_error"], "");
+    }
+
+    #[test]
+    fn applications_state_round_trips_records_and_metadata() {
+        let (_dir, mut db) = db();
+        let empty = db.applications_state().unwrap();
+        assert_eq!(empty["applications"], json!([]));
+        assert_eq!(empty["last_updated_utc"], "");
+        assert_eq!(empty["last_cleanup_utc"], "");
+
+        db.save_applications_state(&json!({
+            "applications": [
+                {"link": "https://example/1", "status": "new",
+                 "links": ["https://mirror/1"], "review_fingerprints": ["fp1"]},
+                {"status": "no link here"}
+            ],
+            "last_updated_utc": "u",
+            "last_digest_utc": "d",
+            "last_digest_date_utc": "dd",
+            "last_digest_error": "de",
+            "last_feedback_utc": "f",
+            "last_cleanup_utc": "c"
+        }))
+        .unwrap();
+
+        let state = db.applications_state().unwrap();
+        assert_eq!(state["applications"].as_array().unwrap().len(), 1);
+        assert_eq!(state["applications"][0]["status"], "new");
+        assert_eq!(state["last_updated_utc"], "u");
+        assert_eq!(state["last_digest_utc"], "d");
+        assert_eq!(state["last_digest_date_utc"], "dd");
+        assert_eq!(state["last_digest_error"], "de");
+        assert_eq!(state["last_feedback_utc"], "f");
+        assert_eq!(state["last_cleanup_utc"], "c");
+    }
+
+    #[test]
+    fn upsert_application_reports_only_the_first_sighting() {
+        let (_dir, mut db) = db();
+        let record = json!({"link": "https://example/1", "status": "new"});
+        assert!(db.upsert_application(&record).unwrap());
+        assert!(!db.upsert_application(&record).unwrap());
+        assert!(
+            !db.upsert_application(&json!({"status": "no link"}))
+                .unwrap()
+        );
+
+        let stored = db.applications_state().unwrap();
+        assert_eq!(stored["applications"].as_array().unwrap().len(), 1);
+
+        assert!(
+            db.upsert_application(&json!({"link": "https://example/2"}))
+                .unwrap()
+        );
+        assert_eq!(
+            db.applications_state().unwrap()["applications"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn telegram_offset_defaults_to_zero_and_survives_updates() {
+        let (_dir, db) = db();
+        assert_eq!(db.telegram_offset().unwrap(), 0);
+        db.save_telegram_offset(42).unwrap();
+        assert_eq!(db.telegram_offset().unwrap(), 42);
+        db.save_telegram_offset(-7).unwrap();
+        assert_eq!(db.telegram_offset().unwrap(), -7);
+    }
+
+    #[test]
+    fn digest_sessions_round_trip_and_keep_only_the_newest_twenty() {
+        let (_dir, db) = db();
+        assert_eq!(db.digest_session("missing").unwrap(), None);
+
+        db.save_digest_session("abc", "2026-01-01T00:00:00Z", &["page one".into()])
+            .unwrap();
+        assert_eq!(
+            db.digest_session("abc").unwrap(),
+            Some(vec!["page one".to_owned()])
+        );
+
+        // Replacing an id keeps one row, not two.
+        db.save_digest_session("abc", "2026-01-01T00:00:01Z", &["replaced".into()])
+            .unwrap();
+        assert_eq!(
+            db.digest_session("abc").unwrap(),
+            Some(vec!["replaced".to_owned()])
+        );
+
+        for index in 0..21 {
+            db.save_digest_session(
+                &format!("s{index}"),
+                &format!("2026-02-{:02}T00:00:00Z", index + 1),
+                &[format!("page {index}")],
+            )
+            .unwrap();
+        }
+        assert_eq!(db.digest_session("s0").unwrap(), None);
+        assert_eq!(
+            db.digest_session("s20").unwrap(),
+            Some(vec!["page 20".to_owned()])
+        );
+    }
+
+    #[test]
+    fn open_migrates_a_database_missing_later_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE jobs(id INTEGER PRIMARY KEY AUTOINCREMENT,time TEXT NOT NULL,
+                    title TEXT NOT NULL,description TEXT NOT NULL,link TEXT NOT NULL UNIQUE);
+                 CREATE TABLE feed_state(name TEXT PRIMARY KEY,last_checked_at REAL NOT NULL);
+                 INSERT INTO jobs(time,title,description,link)
+                    VALUES('t','Legacy','Desc','https://example/legacy');",
+            )
+            .unwrap();
+        drop(connection);
+
+        let mut db = Database::open(&path).unwrap();
+        let jobs = db.jobs().unwrap();
+        assert_eq!(jobs[0].lead.title, "Legacy");
+        assert_eq!(jobs[0].lead.company, "");
+        db.save_feed_state(&HashMap::from([("wwr".to_owned(), FeedState::default())]))
+            .unwrap();
+        assert_eq!(db.feed_state().unwrap()["wwr"].consecutive_failures, 0);
+    }
+
+    #[test]
+    fn writes_json_and_csv_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let json_path = dir.path().join("out.json");
+        write_json(&json_path, &json!({"count": 1})).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&fs::read_to_string(&json_path).unwrap()).unwrap(),
+            json!({"count": 1})
+        );
+
+        let csv_path = dir.path().join("out.csv");
+        let mut quoted = row("t", "Engineer", "https://example/1");
+        quoted.lead.company = "Acme \"Ltd\"".into();
+        export_csv(&csv_path, &[quoted]).unwrap();
+        let csv = fs::read_to_string(&csv_path).unwrap();
+        let mut lines = csv.lines();
+        assert_eq!(
+            lines.next().unwrap(),
+            "time,title,company,location,salary,source,employment_type,date_posted,description,link"
+        );
+        assert_eq!(
+            lines.next().unwrap(),
+            "\"t\",\"Engineer\",\"Acme \"\"Ltd\"\"\",\"London\",\"£45000\",\"feed\",\"Permanent\",\"2026-01-01\",\"Description\",\"https://example/1\""
+        );
+        assert_eq!(lines.next(), None);
+
+        export_csv(&csv_path, &[]).unwrap();
+        assert_eq!(fs::read_to_string(&csv_path).unwrap().lines().count(), 1);
     }
 }

@@ -154,11 +154,50 @@ mod tests {
     #[test]
     fn cleans_and_matches_whole_phrases() {
         assert_eq!(clean("<b>IT&nbsp; support</b>"), "IT support");
+        assert_eq!(clean("  spaced \n out  "), "spaced out");
+        assert_eq!(clean("a &amp; b"), "a & b");
+        assert_eq!(normalize("<b>IT Support</b>"), "it support");
         assert!(contains_phrase(
             "Senior IT   Support Engineer",
             "it support"
         ));
         assert!(!contains_phrase("JavaScript", "java"));
+        assert!(!contains_phrase("anything", ""));
+        assert!(contains_phrase("Azure/Intune estate", "intune"));
+    }
+
+    #[test]
+    fn find_matches_keeps_order_dedupes_and_honours_the_limit() {
+        let phrases = ["intune".to_owned(), "azure".to_owned(), "intune".to_owned()];
+        assert_eq!(
+            find_matches("Azure and Intune estate", &phrases, 0),
+            ["intune", "azure"]
+        );
+        assert_eq!(
+            find_matches("Azure and Intune estate", &phrases, 1),
+            ["intune"]
+        );
+        assert_eq!(
+            find_matches("Azure and Intune estate", &phrases, 5),
+            ["intune", "azure"]
+        );
+        assert!(find_matches("Nothing here", &phrases, 3).is_empty());
+        assert!(find_matches("Azure", &[], 3).is_empty());
+    }
+
+    #[test]
+    fn dedupe_trims_drops_blanks_and_ignores_case() {
+        assert_eq!(
+            dedupe([
+                " Acme ".to_owned(),
+                "acme".to_owned(),
+                String::new(),
+                "   ".to_owned(),
+                "Globex".to_owned()
+            ]),
+            ["Acme", "Globex"]
+        );
+        assert!(dedupe([]).is_empty());
     }
 
     #[test]
@@ -167,6 +206,105 @@ mod tests {
             normalized_link("HTTPS://Example.com/jobs/1/?utm_source=x&keep=y#top"),
             "https://example.com/jobs/1?keep=y"
         );
+        assert_eq!(
+            normalized_link("https://example.com/jobs/1?ref=a&gclid=b&fbclid=c"),
+            "https://example.com/jobs/1"
+        );
+        // A bare path collapses to the root rather than an empty path.
+        assert_eq!(
+            normalized_link("https://example.com/"),
+            "https://example.com"
+        );
+        // Anything unparseable is passed through trimmed.
+        assert_eq!(normalized_link("  not a url  "), "not a url");
+    }
+
+    #[test]
+    fn splits_company_and_normalizes_suffix() {
+        assert_eq!(
+            split_title_company("Engineer at Acme Ltd"),
+            ("Engineer".into(), "Acme Ltd".into())
+        );
+        assert_eq!(
+            split_title_company("Engineer | Acme"),
+            ("Engineer".into(), "Acme".into())
+        );
+        assert_eq!(
+            split_title_company("Engineer - Acme"),
+            ("Engineer".into(), "Acme".into())
+        );
+        // A separator with nothing on one side is not a split.
+        assert_eq!(
+            split_title_company("Engineer at "),
+            ("Engineer at".into(), String::new())
+        );
+        assert_eq!(
+            split_title_company("Engineer"),
+            ("Engineer".into(), String::new())
+        );
+
+        assert_eq!(normalize_company("Acme Limited"), "acme");
+        assert_eq!(normalize_company("Acme, Inc."), "acme");
+        assert_eq!(normalize_company("Acme PLC"), "acme");
+        // Only a trailing suffix is stripped.
+        assert_eq!(normalize_company("Limited Edition Ltd"), "limited edition");
+        assert_eq!(normalize_company("Acme"), "acme");
+    }
+
+    #[test]
+    fn review_fingerprints_prefer_link_then_role_then_text() {
+        let both = review_fingerprints(
+            "Engineer at Acme Ltd",
+            "Description",
+            "https://example.com/jobs/1?utm_source=x",
+        );
+        assert_eq!(both.len(), 2);
+        assert!(both[0].starts_with("link:"), "{both:?}");
+        assert!(both[1].starts_with("role_company:"), "{both:?}");
+
+        // Tracking params and company suffixes must not change the digests.
+        assert_eq!(
+            both,
+            review_fingerprints(
+                "Engineer at Acme Limited",
+                "Other",
+                "https://example.com/jobs/1"
+            )
+        );
+
+        // No company in the title falls back to a title+description digest.
+        let text_only = review_fingerprints("Engineer", "Description", "");
+        assert_eq!(text_only.len(), 1);
+        assert!(text_only[0].starts_with("text:"), "{text_only:?}");
+        assert_ne!(text_only, review_fingerprints("Engineer", "Different", ""));
+
+        // Nothing to fingerprint at all.
+        assert!(review_fingerprints("", "", "").is_empty());
+    }
+
+    #[test]
+    fn digest_is_lowercase_hex_and_input_sensitive() {
+        let hash = digest("roleforge");
+        assert_eq!(hash.len(), 64);
+        assert!(
+            hash.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
+        );
+        assert_eq!(
+            hash,
+            "149e6280edfca862fb7d4ad945f11f038b2cc166543039c33a58c5b8f4986a48"
+        );
+        assert_ne!(digest("roleforge"), digest("roleforg"));
+    }
+
+    #[test]
+    fn truncate_cuts_on_a_word_boundary() {
+        assert_eq!(truncate("short", 20), "short");
+        assert_eq!(truncate("  <b>short</b>  ", 20), "short");
+        assert_eq!(truncate("one two three four", 12), "one two…");
+        // No space to break on: the cut lands mid-word.
+        assert_eq!(truncate("abcdefghij", 5), "abcd…");
+        assert_eq!(truncate("exactly ten", 11), "exactly ten");
     }
 
     // Properties, not examples: these hold for every input, and the fingerprint
@@ -195,14 +333,5 @@ mod tests {
         fn truncate_respects_limit(value in r"\PC{0,200}", limit in 1usize..100) {
             proptest::prop_assert!(truncate(&value, limit).chars().count() <= limit);
         }
-    }
-
-    #[test]
-    fn splits_company_and_normalizes_suffix() {
-        assert_eq!(
-            split_title_company("Engineer at Acme Ltd"),
-            ("Engineer".into(), "Acme Ltd".into())
-        );
-        assert_eq!(normalize_company("Acme Limited"), "acme");
     }
 }
