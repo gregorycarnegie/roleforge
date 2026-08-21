@@ -1,0 +1,38 @@
+{
+  "personal_info": {
+    "name": "Alex Example",
+    "title": "IT Support Engineer",
+    "location": {
+      "city": "London",
+      "country": "United Kingdom"
+    },
+    "target_roles": [
+      "IT Support Engineer",
+      "Systems Administrator",
+      "Service Desk Analyst"
+    ],
+    "preferences": {
+      "remote": true,
+      "hybrid": true,
+      "onsite": false,
+      "relocation": false,
+      "preferred_locations": ["London", "United Kingdom", "UK"],
+      "minimum_salary_gbp": 35000
+    }
+  },
+  "technical_skills": {
+    "skills": ["Microsoft 365", "Active Directory", "Windows", "Linux", "PowerShell"],
+    "competencies": ["troubleshooting", "user support", "documentation", "onboarding"]
+  },
+  "summary": "IT support professional experienced in user support, endpoint administration, identity systems, and technical documentation.",
+  "experience": [
+    {
+      "title": "IT Support Engineer",
+      "company": "Example Company",
+      "responsibilities": [
+        "Resolved hardware, software, identity, and Microsoft 365 support requests.",
+        "Improved onboarding documentation and automated routine PowerShell tasks."
+      ]
+    }
+  ]
+}

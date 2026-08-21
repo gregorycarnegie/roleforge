@@ -1,0 +1,17 @@
+/target
+.env
+resume.json
+*.sqlite3
+*.sqlite3-*
+jobs.csv
+matches.json
+desc.json
+alerts_state.json
+seen_jobs_state.json
+applications.json
+feed_state.json
+daily_digest.json
+application_briefs.json
+borderline_matches.json
+feedback_metrics.json
+output.log

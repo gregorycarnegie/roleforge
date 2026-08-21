@@ -1,0 +1,20 @@
+[package]
+name = "roleforge"
+version = "0.1.0"
+edition = "2024"
+description = "Job-market intelligence and resume-aware role matching"
+license = "MIT"
+repository = "https://github.com/gregorycarnegie/roleforge"
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+env_logger = "0.11"
+log = "0.4"
+quick-xml = "0.38"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+url = "2"
