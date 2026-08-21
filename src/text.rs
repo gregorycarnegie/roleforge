@@ -2,6 +2,7 @@ use quick_xml::escape::unescape;
 use regex::Regex;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+use std::fmt::Write;
 use std::sync::OnceLock;
 use url::Url;
 
@@ -103,7 +104,12 @@ pub fn normalize_company(value: &str) -> String {
 }
 
 fn digest(value: &str) -> String {
-    format!("{:x}", Sha256::digest(value.as_bytes()))
+    Sha256::digest(value.as_bytes())
+        .iter()
+        .fold(String::with_capacity(64), |mut hex, byte| {
+            write!(hex, "{byte:02x}").expect("writing to a string cannot fail");
+            hex
+        })
 }
 
 pub fn review_fingerprints(title: &str, description: &str, link: &str) -> Vec<String> {
@@ -161,6 +167,34 @@ mod tests {
             normalized_link("HTTPS://Example.com/jobs/1/?utm_source=x&keep=y#top"),
             "https://example.com/jobs/1?keep=y"
         );
+    }
+
+    // Properties, not examples: these hold for every input, and the fingerprint
+    // and digest paths depend on them for arbitrary scraped text.
+    proptest::proptest! {
+        // Dedup keys come from normalized_link, so a second pass must be a no-op —
+        // otherwise the same job fingerprints two ways and slips past the filter.
+        #[test]
+        fn normalized_link_is_idempotent(value in r"\PC{0,80}") {
+            let once = normalized_link(&value);
+            proptest::prop_assert_eq!(normalized_link(&once), once.clone());
+        }
+
+        // clean() output is hashed and rendered; stray or doubled whitespace
+        // would split otherwise-identical strings into separate fingerprints.
+        #[test]
+        fn clean_collapses_whitespace(value in r"\PC{0,200}") {
+            let cleaned = clean(&value);
+            proptest::prop_assert_eq!(cleaned.trim(), &cleaned);
+            proptest::prop_assert!(!cleaned.contains("  "));
+        }
+
+        // Telegram rejects over-long messages, so the cap has to hold for every
+        // input, ellipsis included.
+        #[test]
+        fn truncate_respects_limit(value in r"\PC{0,200}", limit in 1usize..100) {
+            proptest::prop_assert!(truncate(&value, limit).chars().count() <= limit);
+        }
     }
 
     #[test]

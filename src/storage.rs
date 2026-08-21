@@ -485,12 +485,8 @@ mod tests {
     use super::*;
     #[test]
     fn database_round_trip() {
-        let path = std::env::temp_dir().join(format!(
-            "roleforge-{}-{}.sqlite3",
-            std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap()
-        ));
-        let mut db = Database::open(&path).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Database::open(dir.path().join("roleforge.sqlite3")).unwrap();
         db.append_jobs(&[JobRow {
             time: "2026-01-01T00:00:00Z".into(),
             lead: JobLead {
@@ -502,7 +498,5 @@ mod tests {
         .unwrap();
         assert_eq!(db.jobs().unwrap().len(), 1);
         assert_eq!(db.latest_batch().unwrap().1[0]["title"], "Engineer");
-        drop(db);
-        fs::remove_file(path).unwrap();
     }
 }

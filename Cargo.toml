@@ -7,14 +7,27 @@ license = "MIT"
 repository = "https://github.com/gregorycarnegie/roleforge"
 
 [dependencies]
-chrono = { version = "0.4", features = ["serde"] }
-env_logger = "0.11"
-log = "0.4"
-quick-xml = "0.38"
-regex = "1"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
-rusqlite = { version = "0.37", features = ["bundled"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2 = "0.10"
-url = "2"
+chrono = { version = "0.4.45", features = ["serde"] }
+env_logger = "0.11.11"
+log = "0.4.33"
+quick-xml = "0.41.0"
+regex = "1.13.1"
+reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "json", "query", "rustls"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+url = "2.5.8"
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
+
+# Release codegen plus line tables, so a sampling profiler resolves frames to
+# source. Separate from `release` so normal builds stay small.
+#
+#   cargo build --profile profiling
+#   samply record ./target/profiling/roleforge.exe pull
+[profile.profiling]
+inherits = "release"
+debug = 1
