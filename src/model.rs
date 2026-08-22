@@ -1,27 +1,20 @@
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Map, Value};
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct JobLead {
     pub title: String,
     pub link: String,
-    #[serde(default)]
     pub source: String,
-    #[serde(default)]
     pub company: String,
-    #[serde(default)]
     pub location: String,
-    #[serde(default)]
     pub salary: String,
-    #[serde(default)]
     pub description: String,
-    #[serde(default)]
     pub employment_type: String,
-    #[serde(default)]
     pub date_posted: String,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct RoleProfile {
     pub name: String,
     #[serde(default)]
@@ -40,10 +33,6 @@ pub struct RoleProfile {
 
 #[derive(Clone, Debug, Default)]
 pub struct ResumeProfile {
-    pub raw: Value,
-    pub candidate_name: String,
-    pub candidate_title: String,
-    pub resume_summary: String,
     pub remote: bool,
     pub hybrid: bool,
     pub onsite: bool,
@@ -82,17 +71,11 @@ impl Default for SearchConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug)]
 pub struct MatchResult {
     pub qualified: bool,
     pub score: i64,
-    pub reasons: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub matched_role_profile: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub candidate: Option<Value>,
-    #[serde(rename = "match", skip_serializing_if = "Option::is_none")]
-    pub matched: Option<Value>,
 }
 
 pub fn string(value: Option<&Value>) -> String {

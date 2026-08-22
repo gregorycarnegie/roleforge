@@ -217,15 +217,13 @@ impl Database {
         )?;
         let data = metadata(&self.connection, "applications")?;
         Ok(
-            json!({"applications":applications,"last_updated_utc":get(&data,"last_updated_utc"),"last_digest_utc":get(&data,"last_digest_utc"),"last_digest_date_utc":get(&data,"last_digest_date_utc"),"last_digest_error":get(&data,"last_digest_error"),"last_feedback_utc":get(&data,"last_feedback_utc"),"last_cleanup_utc":get(&data,"last_cleanup_utc")}),
+            json!({"applications":applications,"last_updated_utc":get(&data,"last_updated_utc"),"last_digest_utc":get(&data,"last_digest_utc"),"last_digest_date_utc":get(&data,"last_digest_date_utc"),"last_digest_error":get(&data,"last_digest_error"),"last_feedback_utc":get(&data,"last_feedback_utc")}),
         )
     }
 
     pub fn save_applications_state(&mut self, state: &Value) -> Result<()> {
         let tx = self.connection.transaction()?;
         tx.execute("DELETE FROM applications", [])?;
-        tx.execute("DELETE FROM application_links", [])?;
-        tx.execute("DELETE FROM application_fingerprints", [])?;
         for (position, application) in state["applications"]
             .as_array()
             .into_iter()
@@ -244,29 +242,13 @@ impl Database {
                 "last_digest_date_utc",
                 "last_digest_error",
                 "last_feedback_utc",
-                "last_cleanup_utc",
             ],
         )?;
         tx.commit()?;
         Ok(())
     }
 
-    pub fn upsert_application(&mut self, record: &Value) -> Result<bool> {
-        let link = record
-            .get("link")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if link.is_empty() {
-            return Ok(false);
-        }
-        let previous: Option<String> = self
-            .connection
-            .query_row(
-                "SELECT payload_json FROM applications WHERE link=?",
-                [link],
-                |row| row.get(0),
-            )
-            .optional()?;
+    pub fn upsert_application(&mut self, record: &Value) -> Result<()> {
         let position = self.connection.query_row(
             "SELECT COALESCE(MAX(position),-1)+1 FROM applications",
             [],
@@ -275,7 +257,7 @@ impl Database {
         let tx = self.connection.transaction()?;
         save_application(&tx, record, position)?;
         tx.commit()?;
-        Ok(previous.is_none())
+        Ok(())
     }
 
     pub fn telegram_offset(&self) -> Result<i64> {
@@ -321,7 +303,6 @@ impl Database {
 
 fn initialize(connection: &Connection) -> Result<()> {
     connection.execute_batch(r#"
-        CREATE TABLE IF NOT EXISTS migrations(id INTEGER PRIMARY KEY);
         CREATE TABLE IF NOT EXISTS jobs(id INTEGER PRIMARY KEY AUTOINCREMENT,time TEXT NOT NULL,title TEXT NOT NULL,description TEXT NOT NULL,link TEXT NOT NULL UNIQUE,company TEXT DEFAULT '',location TEXT DEFAULT '',salary TEXT DEFAULT '',source TEXT DEFAULT '',employment_type TEXT DEFAULT '',date_posted TEXT DEFAULT '');
         CREATE INDEX IF NOT EXISTS idx_jobs_time ON jobs(time);
         CREATE TABLE IF NOT EXISTS feed_state(name TEXT PRIMARY KEY,last_checked_at REAL NOT NULL,consecutive_failures INTEGER DEFAULT 0);
@@ -331,24 +312,23 @@ fn initialize(connection: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS alerted_links(position INTEGER NOT NULL,link TEXT PRIMARY KEY);
         CREATE TABLE IF NOT EXISTS pending_alerts(position INTEGER NOT NULL,link TEXT PRIMARY KEY,payload_json TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS applications(position INTEGER NOT NULL,link TEXT PRIMARY KEY,payload_json TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS application_links(link_value TEXT PRIMARY KEY,application_link TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS application_fingerprints(fingerprint TEXT PRIMARY KEY,application_link TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS telegram_digest_sessions(session_id TEXT PRIMARY KEY,created_at TEXT NOT NULL,pages_json TEXT NOT NULL);
-        INSERT OR IGNORE INTO migrations(id) VALUES(1),(2),(3);
     "#)?;
-    // Older databases may have migration rows without all columns after manual repairs.
+    // A database carried over from the Python bot predates these columns, and
+    // CREATE TABLE IF NOT EXISTS will not add them to a table that already
+    // exists. Covered by open_migrates_a_database_missing_later_columns.
     let columns = table_columns(connection, "jobs")?;
-    for (name, sql_type) in [
-        ("company", "TEXT DEFAULT ''"),
-        ("location", "TEXT DEFAULT ''"),
-        ("salary", "TEXT DEFAULT ''"),
-        ("source", "TEXT DEFAULT ''"),
-        ("employment_type", "TEXT DEFAULT ''"),
-        ("date_posted", "TEXT DEFAULT ''"),
+    for name in [
+        "company",
+        "location",
+        "salary",
+        "source",
+        "employment_type",
+        "date_posted",
     ] {
         if !columns.contains(name) {
             connection.execute(
-                &format!("ALTER TABLE jobs ADD COLUMN {name} {sql_type}"),
+                &format!("ALTER TABLE jobs ADD COLUMN {name} TEXT DEFAULT ''"),
                 [],
             )?;
         }
@@ -420,28 +400,6 @@ fn save_application(tx: &Transaction<'_>, record: &Value, position: i64) -> Resu
         "INSERT OR REPLACE INTO applications(position,link,payload_json) VALUES(?,?,?)",
         params![position, link, serde_json::to_string(record)?],
     )?;
-    for value in record
-        .get("links")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .chain(std::iter::once(link))
-    {
-        tx.execute(
-            "INSERT OR REPLACE INTO application_links(link_value,application_link) VALUES(?,?)",
-            params![value, link],
-        )?;
-    }
-    for value in record
-        .get("review_fingerprints")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-    {
-        tx.execute("INSERT OR REPLACE INTO application_fingerprints(fingerprint,application_link) VALUES(?,?)", params![value,link])?;
-    }
     Ok(())
 }
 
@@ -647,7 +605,6 @@ mod tests {
         let empty = db.applications_state().unwrap();
         assert_eq!(empty["applications"], json!([]));
         assert_eq!(empty["last_updated_utc"], "");
-        assert_eq!(empty["last_cleanup_utc"], "");
 
         db.save_applications_state(&json!({
             "applications": [
@@ -672,27 +629,24 @@ mod tests {
         assert_eq!(state["last_digest_date_utc"], "dd");
         assert_eq!(state["last_digest_error"], "de");
         assert_eq!(state["last_feedback_utc"], "f");
-        assert_eq!(state["last_cleanup_utc"], "c");
     }
 
     #[test]
-    fn upsert_application_reports_only_the_first_sighting() {
+    fn upsert_application_is_keyed_on_the_link() {
         let (_dir, mut db) = db();
         let record = json!({"link": "https://example/1", "status": "new"});
-        assert!(db.upsert_application(&record).unwrap());
-        assert!(!db.upsert_application(&record).unwrap());
-        assert!(
-            !db.upsert_application(&json!({"status": "no link"}))
-                .unwrap()
-        );
+        db.upsert_application(&record).unwrap();
+        // A repeat sighting replaces rather than duplicates.
+        db.upsert_application(&record).unwrap();
+        // A linkless record cannot be keyed, so it is dropped.
+        db.upsert_application(&json!({"status": "no link"}))
+            .unwrap();
 
         let stored = db.applications_state().unwrap();
         assert_eq!(stored["applications"].as_array().unwrap().len(), 1);
 
-        assert!(
-            db.upsert_application(&json!({"link": "https://example/2"}))
-                .unwrap()
-        );
+        db.upsert_application(&json!({"link": "https://example/2"}))
+            .unwrap();
         assert_eq!(
             db.applications_state().unwrap()["applications"]
                 .as_array()

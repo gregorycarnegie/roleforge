@@ -93,9 +93,6 @@ pub fn load_resume(path: impl AsRef<Path>) -> Result<ResumeProfile> {
     }
 
     Ok(ResumeProfile {
-        candidate_name: string(personal.get("name")),
-        candidate_title: string(personal.get("title")),
-        resume_summary: string(root.get("summary")),
         remote: prefs
             .get("remote")
             .and_then(Value::as_bool)
@@ -121,7 +118,6 @@ pub fn load_resume(path: impl AsRef<Path>) -> Result<ResumeProfile> {
         skills: strings(technical.get("skills")),
         competencies: strings(technical.get("competencies")),
         evidence,
-        raw,
     })
 }
 
@@ -315,8 +311,9 @@ mod tests {
     #[test]
     fn example_resume_is_valid() {
         let profile = load_resume("resume.example.json").unwrap();
-        assert_eq!(profile.candidate_name, "Alex Example");
         assert!(!profile.target_roles.is_empty());
+        assert!(!profile.skills.is_empty());
+        assert!(!profile.evidence.is_empty());
     }
 
     #[test]
@@ -346,9 +343,6 @@ mod tests {
             }"#,
         );
         let profile = load_resume(&path).unwrap();
-        assert_eq!(profile.candidate_name, "Alex");
-        assert_eq!(profile.candidate_title, "Engineer");
-        assert_eq!(profile.resume_summary, "Support specialist");
         assert!(profile.remote && profile.hybrid && profile.relocation);
         assert!(!profile.onsite);
         assert_eq!(profile.minimum_salary_gbp, 42_000);
@@ -374,14 +368,12 @@ mod tests {
                 )
             ]
         );
-        assert_eq!(profile.raw["personal_info"]["name"], "Alex");
     }
 
     #[test]
     fn load_resume_tolerates_an_empty_document() {
         let dir = tempfile::tempdir().unwrap();
         let profile = load_resume(write(&dir, "bare.json", "{}")).unwrap();
-        assert_eq!(profile.candidate_name, "");
         assert_eq!(profile.minimum_salary_gbp, 0);
         assert!(!profile.remote && !profile.hybrid && !profile.onsite && !profile.relocation);
         assert!(profile.preferred_locations.is_empty());

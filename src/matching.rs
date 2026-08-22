@@ -11,8 +11,6 @@ use std::sync::OnceLock;
 pub struct SalaryInfo {
     pub min_gbp: i64,
     pub max_gbp: i64,
-    pub currency: String,
-    pub cadence: String,
 }
 
 pub fn location_fit(
@@ -56,11 +54,12 @@ pub fn location_fit(
     }
 }
 
-fn currency(token: &str) -> Option<(&'static str, f64)> {
+/// Conversion rate into GBP. The currency name itself is not scored on.
+fn currency(token: &str) -> Option<f64> {
     match token.trim().to_lowercase().as_str() {
-        "£" | "gbp" | "pound" | "pounds" => Some(("gbp", 1.0)),
-        "$" | "us$" | "usd" | "dollar" | "dollars" => Some(("usd", 0.79)),
-        "€" | "eur" | "euro" | "euros" => Some(("eur", 0.86)),
+        "£" | "gbp" | "pound" | "pounds" => Some(1.0),
+        "$" | "us$" | "usd" | "dollar" | "dollars" => Some(0.79),
+        "€" | "eur" | "euro" | "euros" => Some(0.86),
         _ => None,
     }
 }
@@ -131,7 +130,7 @@ pub fn extract_salary(text: &str) -> Option<SalaryInfo> {
                 (caps.get(3)?.as_str(), value, value)
             }
         };
-        let (currency, rate) = currency(currency_text)?;
+        let rate = currency(currency_text)?;
         let matched = caps.get(0)?;
         let end = (matched.end() + 32).min(normalized.len());
         let (cadence, multiplier) = cadence(&normalized[matched.start()..end]);
@@ -141,8 +140,6 @@ pub fn extract_salary(text: &str) -> Option<SalaryInfo> {
         return Some(SalaryInfo {
             min_gbp: (low.min(high) * rate * multiplier).round() as i64,
             max_gbp: (low.max(high) * rate * multiplier).round() as i64,
-            currency: currency.into(),
-            cadence: cadence.into(),
         });
     }
     None
@@ -277,10 +274,7 @@ pub fn score_job(
         return MatchResult {
             qualified: false,
             score: 0,
-            reasons,
-            matched_role_profile: None,
             candidate: None,
-            matched: None,
         };
     }
 
@@ -296,10 +290,7 @@ pub fn score_job(
         return MatchResult {
             qualified: false,
             score: 0,
-            reasons,
-            matched_role_profile: None,
             candidate: None,
-            matched: None,
         };
     }
 
@@ -430,14 +421,10 @@ pub fn score_job(
         "intro_message": format!("Hi, I'm interested in the {title} role at {company}. My background aligns well with the requirements."),
         "application_ready": score >= 45, "feedback_keywords": feedback_keywords
     });
-    let qualified = score >= MIN_MATCH_SCORE;
     MatchResult {
-        qualified,
+        qualified: score >= MIN_MATCH_SCORE,
         score,
-        reasons: reasons.into_iter().take(6).collect(),
-        matched_role_profile: (!role_name.is_empty()).then_some(role_name),
-        candidate: Some(candidate.clone()),
-        matched: qualified.then_some(candidate),
+        candidate: Some(candidate),
     }
 }
 
@@ -557,6 +544,22 @@ mod tests {
         }
     }
 
+    /// The reasons production actually ships, read back off the candidate.
+    fn reasons(result: &MatchResult) -> Vec<String> {
+        result
+            .candidate
+            .as_ref()
+            .map_or_else(Vec::new, |candidate| {
+                candidate["reasons"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|value| value.as_str())
+                    .map(str::to_owned)
+                    .collect()
+            })
+    }
+
     fn score(item: &JobLead) -> MatchResult {
         score_job(
             item,
@@ -572,32 +575,23 @@ mod tests {
 
     #[test]
     fn parses_and_annualizes_salary() {
+        // Every currency and cadence is observable through the annualized GBP
+        // figures alone, which is all that scoring reads.
         let annual = extract_salary("£40k - £50k per year").unwrap();
         assert_eq!((annual.min_gbp, annual.max_gbp), (40_000, 50_000));
-        assert_eq!(
-            (annual.currency.as_str(), annual.cadence.as_str()),
-            ("gbp", "year")
-        );
 
         let hourly = extract_salary("£20 - £25 per hour").unwrap();
         assert_eq!((hourly.min_gbp, hourly.max_gbp), (41_600, 52_000));
-        assert_eq!(hourly.cadence, "hour");
 
         // A non-unit rate and multiplier together: catches a swapped * for /.
         let usd = extract_salary("$60k - $80k").unwrap();
         assert_eq!((usd.min_gbp, usd.max_gbp), (47_400, 63_200));
-        assert_eq!(usd.currency, "usd");
 
         let monthly = extract_salary("5500 eur per month").unwrap();
         assert_eq!(monthly.min_gbp, 56_760);
-        assert_eq!(
-            (monthly.currency.as_str(), monthly.cadence.as_str()),
-            ("eur", "month")
-        );
 
         let daily = extract_salary("£450 per day").unwrap();
         assert_eq!(daily.min_gbp, 117_000);
-        assert_eq!(daily.cadence, "day");
     }
 
     #[test]
@@ -608,22 +602,23 @@ mod tests {
         // The floor is exclusive: exactly £1000 a year still counts.
         assert_eq!(extract_salary("£1000 per year").unwrap().min_gbp, 1_000);
         assert_eq!(extract_salary("competitive salary"), None);
-        // Cadence is read from a window after the match, not the whole string.
+        // Cadence is read from a window after the match, not the whole string:
+        // "per hour" falls outside it, so £45k stays an annual figure.
         assert_eq!(
             extract_salary("£45k for the role. Interviews are held per hour, weekly.")
                 .unwrap()
-                .cadence,
-            "year"
+                .min_gbp,
+            45_000
         );
     }
 
     #[test]
     fn reads_every_supported_currency_token() {
-        assert_eq!(currency("GBP"), Some(("gbp", 1.0)));
-        assert_eq!(currency(" £ "), Some(("gbp", 1.0)));
-        assert_eq!(currency("us$"), Some(("usd", 0.79)));
-        assert_eq!(currency("euros"), Some(("eur", 0.86)));
-        assert_eq!(currency("€"), Some(("eur", 0.86)));
+        assert_eq!(currency("GBP"), Some(1.0));
+        assert_eq!(currency(" £ "), Some(1.0));
+        assert_eq!(currency("us$"), Some(0.79));
+        assert_eq!(currency("euros"), Some(0.86));
+        assert_eq!(currency("€"), Some(0.86));
         assert_eq!(currency("btc"), None);
     }
 
@@ -922,7 +917,6 @@ mod tests {
         // 8 whitelist + 34 target title + 24 skills + 12 competencies
         // + 30 title boost + 5 role delta + 4 salary fit.
         assert_eq!(result.score, 117);
-        assert_eq!(result.matched_role_profile.as_deref(), Some("IT Support"));
 
         let candidate = result.candidate.as_ref().unwrap();
         assert_eq!(candidate["company"], "Acme Ltd");
@@ -947,23 +941,21 @@ mod tests {
             candidate["why_this_fits"][0],
             "Matches your it support engineer experience."
         );
-        assert_eq!(result.matched.as_ref(), Some(candidate));
-
-        let reasons = result.reasons.join(" | ");
-        assert!(
-            reasons.contains("location fit: local/hybrid compatible"),
-            "{reasons}"
-        );
-        assert!(reasons.contains("company whitelist: acme"), "{reasons}");
-        assert!(
-            reasons.contains("target role in title: it support engineer"),
-            "{reasons}"
-        );
         // Reasons are capped at six; the salary note is the seventh here.
-        assert_eq!(result.reasons.len(), 6);
+        assert_eq!(reasons(&result).len(), 6);
+        let joined = reasons(&result).join(" | ");
         assert!(
-            reasons.contains("skills in description: intune, active directory"),
-            "{reasons}"
+            joined.contains("location fit: local/hybrid compatible"),
+            "{joined}"
+        );
+        assert!(joined.contains("company whitelist: acme"), "{joined}");
+        assert!(
+            joined.contains("target role in title: it support engineer"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("skills in description: intune, active directory"),
+            "{joined}"
         );
     }
 
@@ -982,15 +974,11 @@ mod tests {
             "2026-01-01T00:00:00Z",
             &[],
         );
+        // The reject reason itself is covered where it is produced, by the
+        // location_fit tests above.
         assert!(!result.qualified);
         assert_eq!(result.score, 0);
-        assert_eq!(
-            result.reasons,
-            ["location reject: not aligned with preferences"]
-        );
         assert!(result.candidate.is_none());
-        assert!(result.matched.is_none());
-        assert!(result.matched_role_profile.is_none());
     }
 
     #[test]
@@ -1000,17 +988,11 @@ mod tests {
             ..lead("IT Support Engineer", "Remote. Intune.")
         };
         let result = score(&item);
+        // Scoring stops before any keyword work; company_preference's own
+        // tests cover the reject reason.
         assert!(!result.qualified);
         assert_eq!(result.score, 0);
         assert!(result.candidate.is_none());
-        assert!(result.matched.is_none());
-        assert_eq!(
-            result.reasons,
-            [
-                "location fit: remote compatible",
-                "company reject: blacklisted employer spamcorp"
-            ]
-        );
     }
 
     #[test]
@@ -1020,15 +1002,14 @@ mod tests {
             ..lead("IT Support Engineer", "Remote. Intune.")
         };
         let result = score(&item);
-        let candidate = result.candidate.unwrap();
-        assert_eq!(candidate["shortlisted"], true);
-        assert_eq!(candidate["company_control"], "priority");
         assert!(
-            result
-                .reasons
+            reasons(&result)
                 .iter()
                 .any(|r| r == "company shortlist: globex")
         );
+        let candidate = result.candidate.unwrap();
+        assert_eq!(candidate["shortlisted"], true);
+        assert_eq!(candidate["company_control"], "priority");
     }
 
     #[test]
@@ -1055,8 +1036,7 @@ mod tests {
         let senior = score(&lead("Senior IT Support Engineer", "Remote. Intune."));
         assert_eq!(senior.score, baseline - 12);
         assert!(
-            senior
-                .reasons
+            reasons(&senior)
                 .iter()
                 .any(|r| r == "seniority penalty: senior")
         );
@@ -1067,8 +1047,7 @@ mod tests {
         ));
         assert!(!wrong_track.qualified, "score was {}", wrong_track.score);
         assert!(
-            wrong_track
-                .reasons
+            reasons(&wrong_track)
                 .iter()
                 .any(|r| r == "title penalty: machine learning")
         );
@@ -1092,7 +1071,7 @@ mod tests {
             ..ResumeProfile::default()
         };
         let plain = SearchConfig::default();
-        let note = |item: &JobLead| score_job(item, "feed", &lean, &plain, "t", &[]).reasons;
+        let note = |item: &JobLead| reasons(&score_job(item, "feed", &lean, &plain, "t", &[]));
         assert_eq!(
             note(&low),
             [
@@ -1127,7 +1106,7 @@ mod tests {
         let mut no_preference = lean.clone();
         no_preference.minimum_salary_gbp = 0;
         let quiet =
-            |item: &JobLead| score_job(item, "feed", &no_preference, &plain, "t", &[]).reasons;
+            |item: &JobLead| reasons(&score_job(item, "feed", &no_preference, &plain, "t", &[]));
         for item in [&low, &high, &exact] {
             assert_eq!(
                 quiet(item),
@@ -1159,7 +1138,7 @@ mod tests {
         // + 12 (two skills in the title) + 6 (two competencies).
         assert_eq!(result.score, 70);
         assert_eq!(
-            result.reasons,
+            reasons(&result),
             [
                 "location fit: remote compatible",
                 "target role in title: alpha one",
@@ -1183,12 +1162,11 @@ mod tests {
         let capped = score_job(&item, "feed", &wide, &search(), "t", &[]);
         // find_matches stops at 3, so the title bonus saturates at 34 + 7 * 2.
         assert!(
-            capped
-                .reasons
+            reasons(&capped)
                 .iter()
                 .any(|r| r == "target role in title: role0, role1, role2"),
             "{:?}",
-            capped.reasons
+            reasons(&capped)
         );
         assert_eq!(capped.score, 56);
     }
@@ -1197,7 +1175,6 @@ mod tests {
     fn qualification_tracks_the_minimum_score() {
         let weak = score(&lead("IAM Coordinator", "Remote."));
         assert!(!weak.qualified);
-        assert!(weak.matched.is_none());
         assert!(weak.score < MIN_MATCH_SCORE);
         let candidate = weak.candidate.unwrap();
         assert_eq!(candidate["application_ready"], false);
