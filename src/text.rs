@@ -105,8 +105,38 @@ pub fn normalized_link(value: &str) -> String {
     url.to_string().trim_end_matches('/').to_owned()
 }
 
+/// A colon can also introduce a qualifier ("Remote: IT Support Engineer"), so
+/// the left half only counts as a company when it reads like one.
+fn looks_like_company(value: &str) -> bool {
+    !value.is_empty()
+        && value.split_whitespace().count() <= 5
+        && !matches!(
+            normalize(value).as_str(),
+            "remote"
+                | "hybrid"
+                | "onsite"
+                | "on-site"
+                | "new"
+                | "urgent"
+                | "hiring"
+                | "job"
+                | "featured"
+                | "contract"
+                | "full time"
+                | "part time"
+        )
+}
+
+/// Feeds spell the pairing two ways: "Role at Company" and "Company: Role".
+/// The colon form is tried first, being the less ambiguous of the two.
 pub fn split_title_company(value: &str) -> (String, String) {
     let title = clean(value);
+    if let Some((company, role)) = title.split_once(": ")
+        && looks_like_company(company.trim())
+        && !role.trim().is_empty()
+    {
+        return (role.trim().to_owned(), company.trim().to_owned());
+    }
     for separator in [" at ", " | ", " - ", " — ", " – "] {
         if let Some((left, right)) = title.split_once(separator)
             && !left.trim().is_empty()
@@ -263,6 +293,26 @@ mod tests {
         assert_eq!(
             split_title_company("Engineer - Acme"),
             ("Engineer".into(), "Acme".into())
+        );
+        // We Work Remotely and friends put the company first, behind a colon.
+        assert_eq!(
+            split_title_company("Ignition, Inc.: Mac MSP Help Desk Guru (work from home)"),
+            (
+                "Mac MSP Help Desk Guru (work from home)".into(),
+                "Ignition, Inc.".into()
+            )
+        );
+        // A qualifier or a sentence in front of the colon is not a company.
+        assert_eq!(
+            split_title_company("Remote: IT Support Engineer"),
+            ("Remote: IT Support Engineer".into(), String::new())
+        );
+        assert_eq!(
+            split_title_company("Now hiring for our London office: Engineer"),
+            (
+                "Now hiring for our London office: Engineer".into(),
+                String::new()
+            )
         );
         // A separator with nothing on one side is not a split.
         assert_eq!(
