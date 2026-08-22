@@ -1,7 +1,7 @@
 use crate::{Result, card::card, storage::Database};
 use regex::Regex;
 use reqwest::blocking::{
-    Client, RequestBuilder,
+    Client, RequestBuilder, Response,
     multipart::{Form, Part},
 };
 use serde_json::{Value, json};
@@ -37,15 +37,19 @@ fn call(
     timeout: u64,
     body: impl FnOnce(RequestBuilder) -> RequestBuilder,
 ) -> Result<Value> {
+    // Every Telegram URL carries the bot token, and reqwest puts the URL it
+    // failed on into the error. These errors are logged and persisted, so the
+    // URL is dropped before the token can travel with it.
     let response: Value = body(
         Client::builder()
             .timeout(Duration::from_secs(timeout.max(1)))
             .build()?
             .post(format!("https://api.telegram.org/bot{token}/{method}")),
     )
-    .send()?
-    .error_for_status()?
-    .json()?;
+    .send()
+    .and_then(Response::error_for_status)
+    .and_then(|response| response.json())
+    .map_err(reqwest::Error::without_url)?;
     if response.get("ok") == Some(&Value::Bool(true)) {
         Ok(response.get("result").cloned().unwrap_or(Value::Null))
     } else {
@@ -137,6 +141,22 @@ pub fn format_alert(alert: &Value) -> String {
     lines.join("\n")
 }
 
+/// Telegram caps a caption at 1024 code points. The link is the last line and
+/// the only actionable part of an alert, so the body gives way, never the URL.
+fn caption(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_owned();
+    }
+    let (body, link) = text.rsplit_once('\n').unwrap_or(("", text));
+    let link_length = link.chars().count();
+    // An ellipsis and the newline before the link cost two more characters.
+    if link_length + 2 >= limit {
+        return link.chars().take(limit).collect();
+    }
+    let kept: String = body.chars().take(limit - link_length - 2).collect();
+    format!("{kept}\u{2026}\n{link}")
+}
+
 /// The first image the feed embedded in the posting, usually the company logo
 /// or a banner. Telegram fetches the URL itself, so nothing is downloaded here.
 static IMAGE_URL: LazyLock<Regex> = LazyLock::new(|| {
@@ -155,11 +175,11 @@ fn dispatch(method: &str, payload: impl FnOnce(&str, &str) -> Value) -> Result<V
 }
 
 /// Uploads the drawn card, which has no URL for Telegram to fetch.
-pub fn send_card(png: Vec<u8>, caption: &str) -> Result<Value> {
+pub fn send_card(png: Vec<u8>, text: &str) -> Result<Value> {
     let (token, chat_id, thread_id) = credentials()?;
     let mut form = Form::new()
         .text("chat_id", chat_id)
-        .text("caption", caption.chars().take(1024).collect::<String>())
+        .text("caption", caption(text, 1024))
         .part(
             "photo",
             Part::bytes(png)
@@ -179,18 +199,17 @@ pub fn send_message(message: &str, markup: Option<Value>) -> Result<Value> {
     })
 }
 
-pub fn send_photo(url: &str, caption: &str) -> Result<Value> {
+pub fn send_photo(url: &str, text: &str) -> Result<Value> {
     dispatch("sendPhoto", |chat_id, thread_id| {
-        photo_payload(chat_id, thread_id, url, caption)
+        photo_payload(chat_id, thread_id, url, text)
     })
 }
 
-fn photo_payload(chat_id: &str, thread_id: &str, url: &str, caption: &str) -> Value {
+fn photo_payload(chat_id: &str, thread_id: &str, url: &str, text: &str) -> Value {
     let mut payload = message_payload(chat_id, thread_id, "", None);
     payload.as_object_mut().expect("object").remove("text");
     payload["photo"] = Value::String(url.to_owned());
-    // Telegram caps captions at 1024 characters, counted in code points.
-    payload["caption"] = Value::String(caption.chars().take(1024).collect::<String>());
+    payload["caption"] = Value::String(caption(text, 1024));
     payload
 }
 
@@ -536,6 +555,37 @@ mod tests {
         // Nothing to add leaves the queue untouched.
         assert_eq!(queue_alerts(&mut state, &[]), 0);
         assert_eq!(state["pending_alerts"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_caption_over_the_limit_gives_up_body_before_the_link() {
+        let link = "https://example.com/jobs/1";
+        let text = format!("{}\n{link}", "x".repeat(100));
+        // Inside the limit nothing is touched.
+        assert_eq!(caption(&text, 1024), text);
+
+        // Exactly at the limit is not truncation; one character over is.
+        let exact = format!(
+            "{}
+{link}",
+            "y".repeat(1024 - link.chars().count() - 1)
+        );
+        assert_eq!(exact.chars().count(), 1024);
+        assert_eq!(caption(&exact, 1024), exact);
+        let over = caption(&format!("z{exact}"), 1024);
+        assert_eq!(over.chars().count(), 1024);
+        assert!(over.ends_with(link), "{over}");
+
+        let trimmed = caption(&text, 60);
+        assert_eq!(trimmed.chars().count(), 60);
+        assert!(trimmed.ends_with(link), "{trimmed}");
+        assert!(trimmed.contains('\u{2026}'), "{trimmed}");
+
+        // Once only the link fits, only the link is sent.
+        assert_eq!(caption(&text, 26), link);
+        assert_eq!(caption(&text, 10), "https://ex");
+        // A caption with no link at all is simply cut.
+        assert_eq!(caption("abcdef", 3), "abc");
     }
 
     #[test]

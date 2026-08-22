@@ -4,6 +4,22 @@ All notable changes to RoleForge are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 
+## [0.2.1] - 2026-08-22
+
+### Fixed
+
+- Kept the job link in a photo caption over Telegram's 1024-character cap; the link is the last line, so it was the first thing cut. The body is trimmed instead.
+- Wrote every JSON and CSV snapshot to a scratch file and renamed it into place, so a crash part-way through no longer leaves a truncated document where a reader expects a whole one.
+
+### Changed
+
+- Exited the Telegram worker with one message when no bot token is set, rather than warning and retrying every thirty seconds for the life of the process.
+- Ran CI on Windows as well as Linux.
+
+### Security
+
+- Stripped the request URL from Telegram HTTP errors. Every Telegram URL carries the bot token, and those errors are logged and stored in `last_delivery_error`.
+
 ## [0.2.0] - 2026-08-22
 
 ### Added

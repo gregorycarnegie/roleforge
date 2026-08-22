@@ -419,9 +419,18 @@ fn save_application(tx: &Transaction<'_>, record: &Value, position: i64) -> Resu
     Ok(())
 }
 
-pub fn write_json(path: impl AsRef<Path>, value: &Value) -> Result<()> {
-    fs::write(path, serde_json::to_vec_pretty(value)?)?;
+/// Written beside the target and renamed over it. A crash part-way through
+/// would otherwise leave a truncated snapshot where the next run, or OpenClaw,
+/// expects a whole document.
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let temporary = path.with_extension("tmp");
+    fs::write(&temporary, bytes)?;
+    fs::rename(&temporary, path)?;
     Ok(())
+}
+
+pub fn write_json(path: impl AsRef<Path>, value: &Value) -> Result<()> {
+    write_atomic(path.as_ref(), &serde_json::to_vec_pretty(value)?)
 }
 
 pub fn export_csv(path: impl AsRef<Path>, rows: &[JobRow]) -> Result<()> {
@@ -456,8 +465,7 @@ pub fn export_csv(path: impl AsRef<Path>, rows: &[JobRow]) -> Result<()> {
         );
         output.push('\n');
     }
-    fs::write(path, output)?;
-    Ok(())
+    write_atomic(path.as_ref(), output.as_bytes())
 }
 
 #[cfg(test)]
@@ -836,5 +844,13 @@ mod tests {
 
         export_csv(&csv_path, &[]).unwrap();
         assert_eq!(fs::read_to_string(&csv_path).unwrap().lines().count(), 1);
+
+        // Both writes rename into place and leave no scratch file behind.
+        let left_over: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
+            .filter(|name| name.to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(left_over.is_empty(), "{left_over:?}");
     }
 }

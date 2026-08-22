@@ -333,17 +333,17 @@ fn export_action(latest: Option<&str>, staged: Option<&str>, exists: impl Fn() -
 }
 
 pub fn worker() -> Result<()> {
+    // Telegram is optional. Without a token there is nothing to poll, and a
+    // retry loop would only reprint that for the life of the process.
+    if telegram::token().is_empty() {
+        return Err("TELEGRAM_BOT_TOKEN not configured".into());
+    }
     loop {
-        match Database::open(STATE_DB).and_then(|db| telegram::process_updates(&db, 25)) {
-            Ok(_) => {}
-            Err(error) => {
-                warn!("Telegram worker: {error}");
-                thread::sleep(Duration::from_secs(if telegram::token().is_empty() {
-                    30
-                } else {
-                    5
-                }));
-            }
+        if let Err(error) =
+            Database::open(STATE_DB).and_then(|db| telegram::process_updates(&db, 25))
+        {
+            warn!("Telegram worker: {error}");
+            thread::sleep(Duration::from_secs(5));
         }
     }
 }
@@ -351,7 +351,7 @@ pub fn worker() -> Result<()> {
 pub fn run() -> Result<()> {
     thread::spawn(|| {
         if let Err(error) = worker() {
-            error!("Telegram worker stopped: {error}");
+            info!("Telegram worker not running: {error}");
         }
     });
     loop {
