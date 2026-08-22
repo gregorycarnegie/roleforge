@@ -1,10 +1,10 @@
 Every 30-minute run:
 1. Reload `borderline_matches.json` and `application_briefs.json` from disk immediately before analysis.
-2. If both files are missing, unreadable, or have empty candidates/items lists, output exactly nothing.
-3. Use the `generated_at` field in each file as its batch timestamp.
-4. Keep track, in this cron job's own memory between runs, of the latest `generated_at` you have already reviewed for each file separately.
-5. If neither file has a `generated_at` newer than what you have already reviewed, output exactly nothing.
-6. For a new `borderline_matches.json` batch: review each candidate in `candidates`. For each, use the `score`, `reasons`, `why_this_fits`, and `role_profile` fields to make a judgment call. Output exactly one line per candidate:
+2. If both files are missing, unreadable, or have empty `items` lists, output exactly nothing.
+3. Use the `generated_at_utc` field in each file as its batch timestamp.
+4. Keep track, in this cron job's own memory between runs, of the latest `generated_at_utc` you have already reviewed for each file separately.
+5. If neither file has a `generated_at_utc` newer than what you have already reviewed, output exactly nothing.
+6. For a new `borderline_matches.json` batch: review each candidate in `items`. For each, use the `score`, `reasons`, `why_this_fits`, and `role_profile` fields to make a judgment call. Output exactly one line per candidate:
    Borderline: [title] ([link]) — [Apply / Skip / Investigate]: [one-sentence reason]
 7. For a new `application_briefs.json` batch: output exactly one line per item in `items`:
    Brief Ready: [title] ([link])
