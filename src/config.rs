@@ -1,10 +1,10 @@
-use crate::Result;
-use crate::model::{ResumeProfile, RoleProfile, SearchConfig, object, string, strings};
-use crate::text::{dedupe, normalize};
+use crate::{
+    Result,
+    model::{ResumeProfile, RoleProfile, SearchConfig, object, string, strings},
+    text::{dedupe, normalize},
+};
 use serde_json::{Map, Value, json};
-use std::env;
-use std::fs;
-use std::path::Path;
+use std::{env, fs, path::Path};
 
 pub const STATE_DB: &str = "jobbot_state.sqlite3";
 pub const MIN_MATCH_SCORE: i64 = 28;

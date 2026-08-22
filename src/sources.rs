@@ -1,15 +1,13 @@
-use crate::model::{JobLead, object, string};
-use crate::text::{clean, or_fallback};
-use crate::{Error, Result};
-use quick_xml::Reader;
-use quick_xml::events::Event;
+use crate::{
+    Error, Result,
+    model::{JobLead, object, string},
+    text::{clean, or_fallback},
+};
+use quick_xml::{Reader, events::Event};
 use regex::Regex;
 use reqwest::blocking::{Client, RequestBuilder};
 use serde_json::{Value, json};
-use std::collections::HashSet;
-use std::env;
-use std::sync::LazyLock;
-use std::time::Duration;
+use std::{collections::HashSet, env, sync::LazyLock, time::Duration};
 use url::Url;
 
 const USER_AGENT: &str = "RoleForge/0.1 (+https://github.com/gregorycarnegie/roleforge)";

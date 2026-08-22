@@ -1,8 +1,7 @@
 use quick_xml::escape::unescape;
 use regex::Regex;
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
-use std::sync::LazyLock;
+use std::{collections::HashSet, sync::LazyLock};
 use url::Url;
 
 static TAGS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<[^>]+>").expect("valid tag regex"));

@@ -1,10 +1,11 @@
-use crate::Result;
-use crate::model::JobLead;
+use crate::{Result, model::JobLead};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::path::Path;
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::Path,
+};
 
 #[derive(Clone, Debug)]
 pub struct JobRow {

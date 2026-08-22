@@ -1,19 +1,23 @@
-use crate::Result;
-use crate::config::{self, BORDERLINE_MARGIN, MIN_MATCH_SCORE, STATE_DB};
-use crate::matching::score_job;
-use crate::model::{ResumeProfile, string};
-use crate::sources;
-use crate::storage::{self, Database, FeedState, JobRow};
-use crate::telegram;
-use crate::text::{or_fallback, review_fingerprints};
+use crate::{
+    Result,
+    config::{self, BORDERLINE_MARGIN, MIN_MATCH_SCORE, STATE_DB},
+    matching::score_job,
+    model::{ResumeProfile, string},
+    sources,
+    storage::{self, Database, FeedState, JobRow},
+    telegram,
+    text::{or_fallback, review_fingerprints},
+};
 use chrono::{Timelike, Utc};
 use log::{error, info, warn};
 use serde_json::{Value, json};
-use std::collections::HashSet;
-use std::fs;
-use std::path::Path;
-use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    collections::HashSet,
+    fs,
+    path::Path,
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 pub fn pull() -> Result<()> {
     let timestamp = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);

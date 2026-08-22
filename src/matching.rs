@@ -1,8 +1,10 @@
-use crate::config::MIN_MATCH_SCORE;
-use crate::model::{JobLead, MatchResult, ResumeProfile, RoleProfile, SearchConfig};
-use crate::text::{
-    clean, contains_phrase, dedupe, find_matches, normalize, or_fallback, split_title_company,
-    truncate,
+use crate::{
+    config::MIN_MATCH_SCORE,
+    model::{JobLead, MatchResult, ResumeProfile, RoleProfile, SearchConfig},
+    text::{
+        clean, contains_phrase, dedupe, find_matches, normalize, or_fallback, split_title_company,
+        truncate,
+    },
 };
 use regex::Regex;
 use serde_json::json;

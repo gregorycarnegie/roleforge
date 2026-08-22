@@ -1,10 +1,7 @@
-use crate::Result;
-use crate::storage::Database;
+use crate::{Result, storage::Database};
 use reqwest::blocking::Client;
 use serde_json::{Value, json};
-use std::collections::HashSet;
-use std::env;
-use std::time::Duration;
+use std::{collections::HashSet, env, time::Duration};
 
 pub fn token() -> String {
     env::var("TELEGRAM_BOT_TOKEN")
