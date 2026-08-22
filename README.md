@@ -47,8 +47,8 @@ Optional `job_search_config.json`:
 {
   "priority_companies": ["Monzo"],
   "company_blacklist": ["Example Corp"],
-  "daily_digest": {"enabled": true, "hour_utc": 7, "max_items": 8, "page_size": 4},
-  "feedback": {"enabled": true}
+  "daily_digest": {"enabled": true, "hour_utc": 7, "max_items": 8, "page_size": 4,
+                   "include_statuses": ["new", "reviewed", "applied", "interview"]}
 }
 ```
 

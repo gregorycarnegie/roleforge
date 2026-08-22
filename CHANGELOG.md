@@ -21,12 +21,28 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 - Split each provider adapter's payload mapping out of its HTTP call so the mapping is testable.
 - Extracted the pure decisions inside `pull`, `export_latest`, `generic_html`, and `send_message` into named helpers.
-- Replaced the two nested `match` statements dispatching sources with a lookup table.
+- Dispatched sources with a single flat `match` instead of two nested ones.
 - Dropped a completeness check in `parse_feed` that `dedupe_jobs` already applies.
 - Updated the Rust dependency set to its latest compatible releases.
 - Adapted Reqwest configuration for its `rustls` and `query` features.
 - Adapted SHA-256 fingerprint formatting for SHA2 0.11.
 - Replaced the hand-rolled temporary database path in tests with `tempfile`.
+- Replaced every `OnceLock<Regex>` accessor with a `LazyLock` static.
+- Merged the duplicated CDATA branch in `parse_feed` into the text branch, so CDATA now also fills `company`, `location`, and `date_posted`.
+- Backfilled historical review fingerprints in one transaction instead of one per stored job.
+- Defaulted `daily_digest` to unset; every reader already supplies its own fallback, so the defaults now live in one place.
+
+### Removed
+
+- The write-only `application_links`, `application_fingerprints`, and `migrations` tables.
+- `MatchResult.reasons`, `matched_role_profile`, and `match`; the candidate payload already carries them.
+- `ResumeProfile.raw`, `candidate_name`, `candidate_title`, and `resume_summary`, none of which were read.
+- `SalaryInfo.currency` and `cadence`; scoring reads only the annualized GBP range.
+- The inert `feedback` configuration and the `feedback_metrics.json` snapshot it produced.
+- The always-empty `seen_jobs_state.json` snapshot; SQLite is authoritative.
+- The dead `daily_digest.statuses` default, which was never read — digest filtering reads `include_statuses`.
+- The duplicated `OrElseString` traits, replaced by one `text::or_fallback`.
+- Chrono's unused `serde` feature.
 
 ## [0.1.0] - 2026-08-21
 

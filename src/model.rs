@@ -46,30 +46,15 @@ pub struct ResumeProfile {
     pub evidence: Vec<(String, String)>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct SearchConfig {
     pub company_whitelist: Vec<String>,
     pub company_blacklist: Vec<String>,
     pub priority_companies: Vec<String>,
     pub role_profiles: Vec<RoleProfile>,
+    /// Absent keys fall back in the readers themselves, so the unset default is
+    /// Null rather than a second copy of every digest default.
     pub daily_digest: Value,
-    pub feedback: Value,
-}
-
-impl Default for SearchConfig {
-    fn default() -> Self {
-        Self {
-            company_whitelist: vec![],
-            company_blacklist: vec![],
-            priority_companies: vec![],
-            role_profiles: vec![],
-            daily_digest: serde_json::json!({
-                "enabled": true, "hour_utc": 7, "max_items": 8, "page_size": 4,
-                "statuses": ["new", "reviewed", "applied", "interview"]
-            }),
-            feedback: serde_json::json!({"enabled": true, "min_samples": 2}),
-        }
-    }
 }
 
 #[derive(Clone, Debug)]

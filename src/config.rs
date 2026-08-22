@@ -225,9 +225,6 @@ pub fn load_search_config(path: impl AsRef<Path>) -> Result<SearchConfig> {
     if root.get("daily_digest").is_some_and(Value::is_object) {
         config.daily_digest = root["daily_digest"].clone();
     }
-    if root.get("feedback").is_some_and(Value::is_object) {
-        config.feedback = root["feedback"].clone();
-    }
     Ok(config)
 }
 
@@ -382,8 +379,8 @@ mod tests {
         let missing = load_search_config(dir.path().join("missing.json")).unwrap();
         assert!(missing.company_whitelist.is_empty());
         assert_eq!(missing.role_profiles.len(), 3);
-        assert_eq!(missing.daily_digest["hour_utc"], 7);
-        assert_eq!(missing.feedback["min_samples"], 2);
+        // Unset: every digest reader supplies its own fallback.
+        assert!(missing.daily_digest.is_null());
 
         // Present but empty: still defaults.
         let empty = load_search_config(write(&dir, "empty.json", "{}")).unwrap();
@@ -411,8 +408,7 @@ mod tests {
                 "priority_companies": ["Globex"],
                 "role_profiles": [{"name": "custom", "title_keywords": ["support"],
                                    "title_boost": 5, "priority": 1}],
-                "daily_digest": {"hour_utc": 19},
-                "feedback": {"enabled": false}
+                "daily_digest": {"hour_utc": 19}
             }"#,
         );
         let config = load_search_config(&path).unwrap();
@@ -422,17 +418,11 @@ mod tests {
         assert_eq!(config.role_profiles.len(), 1);
         assert_eq!(config.role_profiles[0].name, "custom");
         assert_eq!(config.daily_digest["hour_utc"], 19);
-        assert_eq!(config.feedback["enabled"], false);
 
-        // Non-object daily_digest/feedback keep the defaults.
-        let scalar = load_search_config(write(
-            &dir,
-            "scalar.json",
-            r#"{"daily_digest": 5, "feedback": "on"}"#,
-        ))
-        .unwrap();
-        assert_eq!(scalar.daily_digest["hour_utc"], 7);
-        assert_eq!(scalar.feedback["min_samples"], 2);
+        // A non-object daily_digest is ignored rather than adopted.
+        let scalar =
+            load_search_config(write(&dir, "scalar.json", r#"{"daily_digest": 5}"#)).unwrap();
+        assert!(scalar.daily_digest.is_null());
 
         assert!(load_search_config(write(&dir, "bad.json", "{")).is_err());
     }

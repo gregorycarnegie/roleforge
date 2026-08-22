@@ -7,7 +7,7 @@ license = "MIT"
 repository = "https://github.com/gregorycarnegie/roleforge"
 
 [dependencies]
-chrono = { version = "0.4.45", features = ["serde"] }
+chrono = "0.4.45"
 env_logger = "0.11.11"
 log = "0.4.33"
 quick-xml = "0.41.0"

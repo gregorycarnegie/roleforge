@@ -22,12 +22,13 @@ pub fn pull() -> Result<()> {
     let mut db = Database::open(STATE_DB)?;
     let existing = db.jobs()?;
     let mut links: HashSet<String> = existing.iter().map(|row| row.lead.link.clone()).collect();
-    for row in &existing {
-        db.append_reviewed(
-            &review_fingerprints(&row.lead.title, &row.lead.description, &row.lead.link),
-            50_000,
-        )?;
-    }
+    // Backfill for a database carried over from the Python bot, whose jobs
+    // predate fingerprinting. One transaction, not one per stored job.
+    let backfill: Vec<String> = existing
+        .iter()
+        .flat_map(|row| review_fingerprints(&row.lead.title, &row.lead.description, &row.lead.link))
+        .collect();
+    db.append_reviewed(&backfill, 50_000)?;
 
     let mut state = db.feed_state()?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs_f64();
@@ -144,10 +145,6 @@ pub fn pull() -> Result<()> {
         "application_briefs.json",
         &json!({"generated_at_utc":timestamp,"items":digest["items"].as_array().cloned().unwrap_or_default().into_iter().filter(|item| item.get("application_ready") == Some(&Value::Bool(true))).take(10).collect::<Vec<_>>()}),
     )?;
-    storage::write_json(
-        "feedback_metrics.json",
-        &json!({"generated_at_utc":timestamp,"enabled":search.feedback.get("enabled").and_then(Value::as_bool).unwrap_or(true),"note":"Historical outcomes remain in the compatible applications table."}),
-    )?;
     db.save_applications_state(&applications)?;
 
     let mut alerts = db.alert_state()?;
@@ -157,10 +154,6 @@ pub fn pull() -> Result<()> {
     db.save_alert_state(&alerts)?;
     storage::write_json("alerts_state.json", &alerts)?;
     storage::write_json("feed_state.json", &serde_json::to_value(state.iter().map(|(name,value)| (name.clone(),json!({"last_checked_at":value.last_checked_at,"consecutive_failures":value.consecutive_failures}))).collect::<serde_json::Map<_,_>>())?)?;
-    storage::write_json(
-        "seen_jobs_state.json",
-        &json!({"reviewed_fingerprints":[],"last_run_utc":timestamp,"note":"Fingerprints are stored authoritatively in SQLite."}),
-    )?;
     if !delivery_error.is_empty() {
         error!("{delivery_error}");
     }
