@@ -1,11 +1,12 @@
 use crate::config::MIN_MATCH_SCORE;
 use crate::model::{JobLead, MatchResult, ResumeProfile, RoleProfile, SearchConfig};
 use crate::text::{
-    clean, contains_phrase, dedupe, find_matches, normalize, split_title_company, truncate,
+    clean, contains_phrase, dedupe, find_matches, normalize, or_fallback, split_title_company,
+    truncate,
 };
 use regex::Regex;
 use serde_json::json;
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SalaryInfo {
@@ -94,19 +95,41 @@ fn amount(value: &str, k: Option<&str>) -> Option<f64> {
         .map(|value| if k.is_some() { value * 1000.0 } else { value })
 }
 
+/// Each pattern paired with whether it matches a range and whether the currency
+/// token comes before the figures. Tried in order; the first match wins.
+static SALARY_PATTERNS: LazyLock<[(Regex, bool, bool); 4]> = LazyLock::new(|| {
+    let compile = |pattern| Regex::new(pattern).expect("valid salary regex");
+    [
+        (
+            compile(
+                r"(?i)(£|gbp|us\$|usd|\$|eur|€)\s*(\d[\d,]*(?:\.\d+)?)\s*(k)?\s*(?:-|–|—|to)\s*(?:£|gbp|us\$|usd|\$|eur|€)?\s*(\d[\d,]*(?:\.\d+)?)\s*(k)?",
+            ),
+            true,
+            true,
+        ),
+        (
+            compile(
+                r"(?i)(\d[\d,]*(?:\.\d+)?)\s*(k)?\s*(?:-|–|—|to)\s*(\d[\d,]*(?:\.\d+)?)\s*(k)?\s*(gbp|usd|eur|pounds?|dollars?|euros?)",
+            ),
+            true,
+            false,
+        ),
+        (
+            compile(r"(?i)(£|gbp|us\$|usd|\$|eur|€)\s*(\d[\d,]*(?:\.\d+)?)\s*(k)?"),
+            false,
+            true,
+        ),
+        (
+            compile(r"(?i)(\d[\d,]*(?:\.\d+)?)\s*(k)?\s*(gbp|usd|eur|pounds?|dollars?|euros?)"),
+            false,
+            false,
+        ),
+    ]
+});
+
 pub fn extract_salary(text: &str) -> Option<SalaryInfo> {
-    static RANGE_PREFIX: OnceLock<Regex> = OnceLock::new();
-    static RANGE_SUFFIX: OnceLock<Regex> = OnceLock::new();
-    static SINGLE_PREFIX: OnceLock<Regex> = OnceLock::new();
-    static SINGLE_SUFFIX: OnceLock<Regex> = OnceLock::new();
-    let patterns = [
-        (RANGE_PREFIX.get_or_init(|| Regex::new(r"(?i)(£|gbp|us\$|usd|\$|eur|€)\s*(\d[\d,]*(?:\.\d+)?)\s*(k)?\s*(?:-|–|—|to)\s*(?:£|gbp|us\$|usd|\$|eur|€)?\s*(\d[\d,]*(?:\.\d+)?)\s*(k)?").unwrap()), true, true),
-        (RANGE_SUFFIX.get_or_init(|| Regex::new(r"(?i)(\d[\d,]*(?:\.\d+)?)\s*(k)?\s*(?:-|–|—|to)\s*(\d[\d,]*(?:\.\d+)?)\s*(k)?\s*(gbp|usd|eur|pounds?|dollars?|euros?)").unwrap()), true, false),
-        (SINGLE_PREFIX.get_or_init(|| Regex::new(r"(?i)(£|gbp|us\$|usd|\$|eur|€)\s*(\d[\d,]*(?:\.\d+)?)\s*(k)?").unwrap()), false, true),
-        (SINGLE_SUFFIX.get_or_init(|| Regex::new(r"(?i)(\d[\d,]*(?:\.\d+)?)\s*(k)?\s*(gbp|usd|eur|pounds?|dollars?|euros?)").unwrap()), false, false),
-    ];
     let normalized = clean(text).to_lowercase();
-    for (regex, range, prefix) in patterns {
+    for &(ref regex, range, prefix) in SALARY_PATTERNS.iter() {
         let Some(caps) = regex.captures(&normalized) else {
             continue;
         };
@@ -279,7 +302,7 @@ pub fn score_job(
     }
 
     let company = if item.company.trim().is_empty() {
-        split_title_company(&title).1.or_else(source)
+        or_fallback(split_title_company(&title).1, source)
     } else {
         clean(&item.company)
     };
@@ -425,19 +448,6 @@ pub fn score_job(
         qualified: score >= MIN_MATCH_SCORE,
         score,
         candidate: Some(candidate),
-    }
-}
-
-trait OrElseString {
-    fn or_else(self, fallback: &str) -> String;
-}
-impl OrElseString for String {
-    fn or_else(self, fallback: &str) -> String {
-        if self.is_empty() {
-            fallback.into()
-        } else {
-            self
-        }
     }
 }
 
@@ -891,12 +901,6 @@ mod tests {
         push_reason(&mut reasons, "");
         push_reason(&mut reasons, "second");
         assert_eq!(reasons, ["first", "second"]);
-    }
-
-    #[test]
-    fn or_else_substitutes_only_for_an_empty_string() {
-        assert_eq!(String::new().or_else("fallback"), "fallback");
-        assert_eq!("kept".to_owned().or_else("fallback"), "kept");
     }
 
     // --- score_job -------------------------------------------------------

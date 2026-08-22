@@ -166,7 +166,7 @@ impl Database {
         )?;
         let metadata = metadata(&self.connection, "alerts")?;
         Ok(
-            json!({"alerted_links":alerted,"pending_alerts":pending,"last_run_utc":metadata.get("last_run_utc").cloned().unwrap_or_default(),"last_delivery_utc":metadata.get("last_delivery_utc").cloned().unwrap_or_default(),"last_delivery_error":metadata.get("last_delivery_error").cloned().unwrap_or_default()}),
+            json!({"alerted_links":alerted,"pending_alerts":pending,"last_run_utc":get(&metadata,"last_run_utc"),"last_delivery_utc":get(&metadata,"last_delivery_utc"),"last_delivery_error":get(&metadata,"last_delivery_error")}),
         )
     }
 

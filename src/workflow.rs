@@ -5,7 +5,7 @@ use crate::model::{ResumeProfile, string};
 use crate::sources;
 use crate::storage::{self, Database, FeedState, JobRow};
 use crate::telegram;
-use crate::text::review_fingerprints;
+use crate::text::{or_fallback, review_fingerprints};
 use chrono::{Timelike, Utc};
 use log::{error, info, warn};
 use serde_json::{Value, json};
@@ -57,7 +57,7 @@ pub fn pull() -> Result<()> {
         if !feed_due(state.get(&name), now, feed_interval(&source)) {
             continue;
         }
-        let label = source_label(&source, &name);
+        let label = or_fallback(string(source.get("display_name")), &name);
         match sources::fetch(&source) {
             Ok(items) => {
                 state.insert(
@@ -70,7 +70,11 @@ pub fn pull() -> Result<()> {
                 for item in items {
                     let fingerprints =
                         review_fingerprints(&item.title, &item.description, &item.link);
-                    if already_seen(&item.link, &links) || db.has_reviewed(&fingerprints)? {
+                    // A linkless lead cannot be deduplicated or applied to.
+                    if item.link.is_empty()
+                        || links.contains(&item.link)
+                        || db.has_reviewed(&fingerprints)?
+                    {
                         continue;
                     }
                     let result = score_job(&item, &label, &profile, &search, &timestamp, &lockouts);
@@ -92,7 +96,9 @@ pub fn pull() -> Result<()> {
                                 lead: item.clone(),
                             });
                             links.insert(item.link);
-                        } else if is_borderline(result.score) {
+                        // Just short of the bar: worth recording for review,
+                        // not worth alerting on.
+                        } else if result.score >= MIN_MATCH_SCORE - BORDERLINE_MARGIN {
                             borderline.push(candidate);
                         }
                     }
@@ -325,7 +331,7 @@ pub fn worker() -> Result<()> {
             Ok(_) => {}
             Err(error) => {
                 warn!("Telegram worker: {error}");
-                thread::sleep(Duration::from_secs(if telegram::settings().0.is_empty() {
+                thread::sleep(Duration::from_secs(if telegram::token().is_empty() {
                     30
                 } else {
                     5
@@ -379,26 +385,6 @@ fn feed_interval(source: &Value) -> f64 {
 /// A feed never polled before is always due.
 fn feed_due(state: Option<&FeedState>, now: f64, interval: f64) -> bool {
     state.is_none_or(|value| now - value.last_checked_at >= interval)
-}
-
-fn source_label(source: &Value, name: &str) -> String {
-    let display = string(source.get("display_name"));
-    if display.is_empty() {
-        name.to_owned()
-    } else {
-        display
-    }
-}
-
-/// Linkless leads cannot be deduplicated or applied to, and a link already in
-/// this run has been scored already.
-fn already_seen(link: &str, links: &HashSet<String>) -> bool {
-    link.is_empty() || links.contains(link)
-}
-
-/// Just short of the bar: worth recording for review, not worth alerting on.
-fn is_borderline(score: i64) -> bool {
-    score >= MIN_MATCH_SCORE - BORDERLINE_MARGIN
 }
 
 fn after_failure(previous: Option<&FeedState>) -> FeedState {
@@ -566,33 +552,6 @@ mod tests {
         assert!(feed_due(Some(&checked(0.0)), 1_000.0, 900.0));
         assert!(!feed_due(Some(&checked(101.0)), 1_000.0, 900.0));
         assert!(!feed_due(Some(&checked(1_000.0)), 1_000.0, 900.0));
-    }
-
-    #[test]
-    fn source_label_falls_back_to_the_name() {
-        assert_eq!(
-            source_label(&json!({"display_name": "We Work Remotely"}), "wwr"),
-            "We Work Remotely"
-        );
-        assert_eq!(source_label(&json!({"display_name": ""}), "wwr"), "wwr");
-        assert_eq!(source_label(&json!({}), "wwr"), "wwr");
-    }
-
-    #[test]
-    fn already_seen_covers_blank_and_repeated_links() {
-        let links = HashSet::from(["https://example/1".to_owned()]);
-        assert!(already_seen("", &links));
-        assert!(already_seen("https://example/1", &links));
-        assert!(!already_seen("https://example/2", &links));
-        assert!(!already_seen("https://example/2", &HashSet::new()));
-    }
-
-    #[test]
-    fn borderline_starts_one_margin_below_the_match_score() {
-        assert!(is_borderline(MIN_MATCH_SCORE));
-        assert!(is_borderline(MIN_MATCH_SCORE - BORDERLINE_MARGIN));
-        assert!(!is_borderline(MIN_MATCH_SCORE - BORDERLINE_MARGIN - 1));
-        assert!(!is_borderline(0));
     }
 
     #[test]

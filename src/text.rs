@@ -2,20 +2,15 @@ use quick_xml::escape::unescape;
 use regex::Regex;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
-use std::fmt::Write;
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 use url::Url;
 
-fn tags() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"<[^>]+>").expect("valid tag regex"))
-}
+static TAGS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<[^>]+>").expect("valid tag regex"));
 
 pub fn clean(value: &str) -> String {
     let html = value.replace("&nbsp;", " ");
     let decoded = unescape(&html).map_or(html.clone(), |text| text.into_owned());
-    tags()
-        .replace_all(&decoded, " ")
+    TAGS.replace_all(&decoded, " ")
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
@@ -23,6 +18,15 @@ pub fn clean(value: &str) -> String {
 
 pub fn normalize(value: &str) -> String {
     clean(value).to_lowercase()
+}
+
+/// `value` unless it is empty, in which case `fallback`.
+pub fn or_fallback(value: String, fallback: &str) -> String {
+    if value.is_empty() {
+        fallback.to_owned()
+    } else {
+        value
+    }
 }
 
 pub fn contains_phrase(haystack: &str, phrase: &str) -> bool {
@@ -94,22 +98,23 @@ pub fn split_title_company(value: &str) -> (String, String) {
     (title, String::new())
 }
 
+static COMPANY_SUFFIX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)[,\s]+(?:ltd\.?|limited|inc\.?|llc|plc|corp\.?|corporation)$")
+        .expect("valid suffix regex")
+});
+
 pub fn normalize_company(value: &str) -> String {
-    static SUFFIX: OnceLock<Regex> = OnceLock::new();
-    let re = SUFFIX.get_or_init(|| {
-        Regex::new(r"(?i)[,\s]+(?:ltd\.?|limited|inc\.?|llc|plc|corp\.?|corporation)$")
-            .expect("valid suffix regex")
-    });
-    re.replace(normalize(value).trim(), "").trim().to_owned()
+    COMPANY_SUFFIX
+        .replace(normalize(value).trim(), "")
+        .trim()
+        .to_owned()
 }
 
 fn digest(value: &str) -> String {
     Sha256::digest(value.as_bytes())
         .iter()
-        .fold(String::with_capacity(64), |mut hex, byte| {
-            write!(hex, "{byte:02x}").expect("writing to a string cannot fail");
-            hex
-        })
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 pub fn review_fingerprints(title: &str, description: &str, link: &str) -> Vec<String> {
@@ -164,6 +169,12 @@ mod tests {
         assert!(!contains_phrase("JavaScript", "java"));
         assert!(!contains_phrase("anything", ""));
         assert!(contains_phrase("Azure/Intune estate", "intune"));
+    }
+
+    #[test]
+    fn or_fallback_substitutes_only_for_an_empty_string() {
+        assert_eq!(or_fallback(String::new(), "fallback"), "fallback");
+        assert_eq!(or_fallback("kept".to_owned(), "fallback"), "kept");
     }
 
     #[test]

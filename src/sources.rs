@@ -1,5 +1,5 @@
 use crate::model::{JobLead, object, string};
-use crate::text::clean;
+use crate::text::{clean, or_fallback};
 use crate::{Error, Result};
 use quick_xml::Reader;
 use quick_xml::events::Event;
@@ -8,7 +8,7 @@ use reqwest::blocking::{Client, RequestBuilder};
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::env;
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 use std::time::Duration;
 use url::Url;
 
@@ -71,41 +71,45 @@ fn first(value: &Value, keys: &[&str]) -> String {
         .unwrap_or_default()
 }
 
-type Adapter = fn(&Value) -> Result<Vec<JobLead>>;
-
-/// Keyed on the source's "platform", then on its "type"; anything unrecognised
-/// is treated as a plain feed.
-const BY_PLATFORM: &[(&str, Adapter)] = &[
-    ("greenhouse", greenhouse),
-    ("lever", lever),
-    ("ashby", ashby),
-    ("workable", workable),
-    ("generic_html", generic_html),
-];
-const BY_TYPE: &[(&str, Adapter)] = &[
-    ("efc_html", generic_html),
-    ("adzuna", adzuna),
-    ("reed", reed),
-    ("jooble", jooble),
-    ("themuse", themuse),
-    ("arbeitnow", arbeitnow),
-    ("remotive", remotive),
-];
-
-fn adapter(config: &Value) -> Adapter {
-    let look_up = |table: &[(&str, Adapter)], key: &str| {
-        table
-            .iter()
-            .find(|(name, _)| *name == key)
-            .map(|(_, adapter)| *adapter)
-    };
-    look_up(BY_PLATFORM, &cfg(config, "platform"))
-        .or_else(|| look_up(BY_TYPE, &cfg(config, "type")))
-        .unwrap_or(rss)
+/// Dispatches on the source's "platform", then on its "type"; anything
+/// unrecognised is treated as a plain feed.
+pub fn fetch(config: &Value) -> Result<Vec<JobLead>> {
+    match (
+        cfg(config, "platform").as_str(),
+        cfg(config, "type").as_str(),
+    ) {
+        ("greenhouse", _) => greenhouse(config),
+        ("lever", _) => lever(config),
+        ("ashby", _) => ashby(config),
+        ("workable", _) => workable(config),
+        ("generic_html", _) | (_, "efc_html") => generic_html(config),
+        (_, "adzuna") => adzuna(config),
+        (_, "reed") => reed(config),
+        (_, "jooble") => jooble(config),
+        (_, "themuse") => themuse(config),
+        (_, "arbeitnow") => arbeitnow(config),
+        (_, "remotive") => remotive(config),
+        _ => rss(config),
+    }
 }
 
-pub fn fetch(config: &Value) -> Result<Vec<JobLead>> {
-    adapter(config)(config)
+/// Routes one feed element's text into the lead being built. Repeated
+/// description elements are joined; the first link wins.
+fn absorb(job: &mut JobLead, field: &str, value: &str) {
+    match field {
+        "title" => job.title.push_str(value),
+        "link" if job.link.is_empty() => job.link.push_str(value),
+        "description" | "summary" | "content" => {
+            if !job.description.is_empty() {
+                job.description.push(' ');
+            }
+            job.description.push_str(value);
+        }
+        "company" | "author" => job.company.push_str(value),
+        "location" => job.location.push_str(value),
+        "pubdate" | "published" | "updated" => job.date_posted.push_str(value),
+        _ => {}
+    }
 }
 
 pub fn parse_feed(xml: &str, source: &str) -> Result<Vec<JobLead>> {
@@ -137,39 +141,19 @@ pub fn parse_feed(xml: &str, source: &str) -> Result<Vec<JobLead>> {
                     }
                 }
             }
-            Ok(Event::Text(text)) if current.is_some() => {
-                let value = clean(&String::from_utf8_lossy(text.as_ref()));
-                let job = current.as_mut().expect("checked");
-                match field.as_str() {
-                    "title" => job.title.push_str(&value),
-                    "link" if job.link.is_empty() => job.link.push_str(&value),
-                    "description" | "summary" | "content" => {
-                        if !job.description.is_empty() {
-                            job.description.push(' ');
-                        }
-                        job.description.push_str(&value);
-                    }
-                    "company" | "author" => job.company.push_str(&value),
-                    "location" => job.location.push_str(&value),
-                    "pubdate" | "published" | "updated" => job.date_posted.push_str(&value),
-                    _ => {}
-                }
-            }
-            Ok(Event::CData(text)) if current.is_some() => {
-                let value = clean(&String::from_utf8_lossy(text.as_ref()));
-                let job = current.as_mut().expect("checked");
-                match field.as_str() {
-                    "title" => job.title.push_str(&value),
-                    "link" if job.link.is_empty() => job.link.push_str(&value),
-                    "description" | "summary" | "content" => {
-                        if !job.description.is_empty() {
-                            job.description.push(' ');
-                        }
-                        job.description.push_str(&value);
-                    }
-                    _ => {}
-                }
-            }
+            // BytesText and BytesCData are separate types, so the arms cannot
+            // be merged, but CDATA is only an escaping choice: both feed the
+            // same fields.
+            Ok(Event::Text(text)) if current.is_some() => absorb(
+                current.as_mut().expect("checked"),
+                &field,
+                &clean(&String::from_utf8_lossy(text.as_ref())),
+            ),
+            Ok(Event::CData(text)) if current.is_some() => absorb(
+                current.as_mut().expect("checked"),
+                &field,
+                &clean(&String::from_utf8_lossy(text.as_ref())),
+            ),
             Ok(Event::End(tag)) => {
                 let name = String::from_utf8_lossy(tag.local_name().as_ref()).to_lowercase();
                 if (name == "item" || name == "entry") && current.is_some() {
@@ -188,12 +172,7 @@ pub fn parse_feed(xml: &str, source: &str) -> Result<Vec<JobLead>> {
 
 fn rss(config: &Value) -> Result<Vec<JobLead>> {
     let xml = fetch_text(client()?.get(cfg(config, "url")))?;
-    let source = display_name(config);
-    let source = if source.is_empty() {
-        cfg(config, "url")
-    } else {
-        source
-    };
+    let source = or_fallback(display_name(config), &cfg(config, "url"));
     let mut jobs = parse_feed(&xml, &source)?;
     append_context(&mut jobs, &cfg(config, "context_terms"));
     Ok(jobs)
@@ -210,13 +189,14 @@ fn append_context(jobs: &mut [JobLead], context: &str) {
     }
 }
 
+static JSON_LD: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?is)<script[^>]+type=[\"']application/ld\+json[\"'][^>]*>(.*?)</script>"#)
+        .expect("valid json-ld regex")
+});
+
 fn extract_json_ld(html: &str) -> Vec<Value> {
-    static SCRIPT: OnceLock<Regex> = OnceLock::new();
-    let re = SCRIPT.get_or_init(|| {
-        Regex::new(r#"(?is)<script[^>]+type=[\"']application/ld\+json[\"'][^>]*>(.*?)</script>"#)
-            .expect("valid json-ld regex")
-    });
-    re.captures_iter(html)
+    JSON_LD
+        .captures_iter(html)
         .filter_map(|capture| serde_json::from_str(capture.get(1)?.as_str()).ok())
         .collect()
 }
@@ -254,7 +234,7 @@ fn job_from_json_ld(value: &Value, fallback_url: &str, source: &str, company: &s
     let address = location.and_then(|loc| loc.get("address")).map(object);
     JobLead {
         title: value_text(value.get("title")),
-        link: first(value, &["url", "sameAs"]).or_else(fallback_url),
+        link: or_fallback(first(value, &["url", "sameAs"]), fallback_url),
         source: source.into(),
         company: hiring
             .map(|org| value_text(org.get("name")))
@@ -273,19 +253,6 @@ fn job_from_json_ld(value: &Value, fallback_url: &str, source: &str, company: &s
         description: value_text(value.get("description")),
         employment_type: value_text(value.get("employmentType")),
         date_posted: value_text(value.get("datePosted")),
-    }
-}
-
-trait OrElseString {
-    fn or_else(self, fallback: &str) -> String;
-}
-impl OrElseString for String {
-    fn or_else(self, fallback: &str) -> String {
-        if self.is_empty() {
-            fallback.into()
-        } else {
-            self
-        }
     }
 }
 
@@ -422,16 +389,16 @@ fn is_job_link(
             || patterns.iter().any(|pattern| pattern.is_match(link)))
 }
 
+static ANCHOR: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?is)<a\b[^>]*href\s*=\s*[\"']([^\"']+)[\"'][^>]*>(.*?)</a>"#)
+        .expect("valid anchor regex")
+});
+
 fn extract_anchor_links(html: &str, base: &str) -> Vec<(String, String)> {
-    static ANCHOR: OnceLock<Regex> = OnceLock::new();
-    let regex = ANCHOR.get_or_init(|| {
-        Regex::new(r#"(?is)<a\b[^>]*href\s*=\s*[\"']([^\"']+)[\"'][^>]*>(.*?)</a>"#)
-            .expect("valid anchor regex")
-    });
     let Ok(base) = Url::parse(base) else {
         return vec![];
     };
-    regex
+    ANCHOR
         .captures_iter(html)
         .filter_map(|capture| {
             let href = capture.get(1)?.as_str().trim();
@@ -449,20 +416,28 @@ fn extract_anchor_links(html: &str, base: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+static TITLE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?is)<title[^>]*>(.*?)</title>").expect("valid title regex"));
+static META_DESCRIPTION: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?is)<meta[^>]+(?:name|property)=[\"'](?:description|og:description)[\"'][^>]+content=[\"']([^\"']*)[\"']"#,
+    )
+    .expect("valid meta regex")
+});
+
 fn fallback_html_job(html: &str, url: &str, source: &str, company: &str) -> Option<JobLead> {
-    static TITLE: OnceLock<Regex> = OnceLock::new();
-    static DESCRIPTION: OnceLock<Regex> = OnceLock::new();
-    let title = TITLE
-        .get_or_init(|| Regex::new(r"(?is)<title[^>]*>(.*?)</title>").expect("valid title regex"))
-        .captures(html)
-        .and_then(|capture| capture.get(1))
-        .map(|value| clean(value.as_str()))
-        .unwrap_or_default();
+    let first_group = |regex: &Regex| {
+        regex
+            .captures(html)
+            .and_then(|capture| capture.get(1))
+            .map(|value| clean(value.as_str()))
+            .unwrap_or_default()
+    };
+    let title = first_group(&TITLE);
     if title.is_empty() {
         return None;
     }
-    let description = DESCRIPTION.get_or_init(|| Regex::new(r#"(?is)<meta[^>]+(?:name|property)=[\"'](?:description|og:description)[\"'][^>]+content=[\"']([^\"']*)[\"']"#).expect("valid meta regex"))
-        .captures(html).and_then(|capture| capture.get(1)).map(|value| clean(value.as_str())).unwrap_or_default();
+    let description = first_group(&META_DESCRIPTION);
     Some(JobLead {
         title,
         link: url.into(),
@@ -521,7 +496,8 @@ fn lever(config: &Value) -> Result<Vec<JobLead>> {
             break;
         };
         jobs.extend(lever_leads(items, config));
-        if last_page(items.len(), 100) {
+        // A page returning fewer rows than it asked for is the last one.
+        if items.len() < 100 {
             break;
         }
     }
@@ -636,7 +612,7 @@ fn workable_leads(items: &[Value], config: &Value) -> Vec<JobLead> {
 fn adzuna(config: &Value) -> Result<Vec<JobLead>> {
     let app_id = required_env("ADZUNA_APP_ID")?;
     let app_key = required_env("ADZUNA_APP_KEY")?;
-    let country = cfg(config, "country").or_else("gb");
+    let country = or_fallback(cfg(config, "country"), "gb");
     let mut jobs = vec![];
     for page in 1..=2 {
         let base = format!("https://api.adzuna.com/v1/api/jobs/{country}/search/{page}");
@@ -649,7 +625,8 @@ fn adzuna(config: &Value) -> Result<Vec<JobLead>> {
         ]))?;
         let items = array(&payload, "results");
         jobs.extend(adzuna_leads(items, config, &country));
-        if last_page(items.len(), 50) {
+        // A page returning fewer rows than it asked for is the last one.
+        if items.len() < 50 {
             break;
         }
     }
@@ -905,11 +882,6 @@ fn format_salary(
     }
 }
 
-/// A page returning fewer rows than it was asked for is the last one.
-fn last_page(returned: usize, page_size: usize) -> bool {
-    returned < page_size
-}
-
 /// The authenticated SPI endpoint when the source is configured for it, and the
 /// public account endpoint otherwise. `Some(token)` means send bearer auth.
 fn workable_endpoint(config: &Value) -> Result<(String, Option<String>)> {
@@ -973,6 +945,8 @@ mod tests {
                 <title><![CDATA[Desktop Support]]></title>
                 <link href="https://example/jobs/3"/>
                 <summary><![CDATA[Windows estate]]></summary>
+                <author><![CDATA[Acme]]></author>
+                <updated><![CDATA[2026-01-03]]></updated>
             </entry>
         </feed>"#;
         let jobs = parse_feed(atom, "Atom").unwrap();
@@ -982,10 +956,12 @@ mod tests {
         // Repeated description fields are joined, not overwritten.
         assert_eq!(jobs[0].description, "First half. Second half.");
         assert_eq!(jobs[0].date_posted, "2026-01-02");
-        // CDATA feeds the same fields as plain text.
+        // CDATA feeds the same fields as plain text, company and date included.
         assert_eq!(jobs[1].title, "Desktop Support");
         assert_eq!(jobs[1].link, "https://example/jobs/3");
         assert_eq!(jobs[1].description, "Windows estate");
+        assert_eq!(jobs[1].company, "Acme");
+        assert_eq!(jobs[1].date_posted, "2026-01-03");
     }
 
     #[test]
@@ -1101,12 +1077,6 @@ mod tests {
         assert_eq!(first(&value, &["name", "label"]), "Second");
         assert_eq!(first(&value, &["missing"]), "");
         assert_eq!(first(&value, &[]), "");
-    }
-
-    #[test]
-    fn or_else_substitutes_only_for_an_empty_string() {
-        assert_eq!(String::new().or_else("fallback"), "fallback");
-        assert_eq!("kept".to_owned().or_else("fallback"), "kept");
     }
 
     #[test]
@@ -1642,54 +1612,6 @@ mod tests {
     // --- dispatch and scraping helpers -----------------------------------
 
     #[test]
-    fn routes_each_platform_and_type_to_its_adapter() {
-        let routed = |config: Value| adapter(&config);
-        let same = |a: Adapter, b: Adapter| std::ptr::fn_addr_eq(a, b);
-
-        assert!(same(
-            routed(json!({"platform": "greenhouse"})),
-            greenhouse as Adapter
-        ));
-        assert!(same(routed(json!({"platform": "lever"})), lever as Adapter));
-        assert!(same(routed(json!({"platform": "ashby"})), ashby as Adapter));
-        assert!(same(
-            routed(json!({"platform": "workable"})),
-            workable as Adapter
-        ));
-        assert!(same(
-            routed(json!({"platform": "generic_html"})),
-            generic_html as Adapter
-        ));
-
-        assert!(same(
-            routed(json!({"type": "efc_html"})),
-            generic_html as Adapter
-        ));
-        assert!(same(routed(json!({"type": "adzuna"})), adzuna as Adapter));
-        assert!(same(routed(json!({"type": "reed"})), reed as Adapter));
-        assert!(same(routed(json!({"type": "jooble"})), jooble as Adapter));
-        assert!(same(routed(json!({"type": "themuse"})), themuse as Adapter));
-        assert!(same(
-            routed(json!({"type": "arbeitnow"})),
-            arbeitnow as Adapter
-        ));
-        assert!(same(
-            routed(json!({"type": "remotive"})),
-            remotive as Adapter
-        ));
-
-        // Unknown, absent, or feed-shaped sources fall back to RSS.
-        assert!(same(routed(json!({})), rss as Adapter));
-        assert!(same(routed(json!({"platform": "myspace"})), rss as Adapter));
-        assert!(same(routed(json!({"type": "myspace"})), rss as Adapter));
-        // "platform" is consulted before "type".
-        assert!(same(
-            routed(json!({"platform": "lever", "type": "adzuna"})),
-            lever as Adapter
-        ));
-    }
-
-    #[test]
     fn appends_context_terms_to_every_description() {
         let mut jobs = vec![
             JobLead {
@@ -1808,14 +1730,6 @@ mod tests {
             &keywords,
             &[]
         ));
-    }
-
-    #[test]
-    fn pagination_stops_on_a_short_page() {
-        assert!(last_page(0, 100));
-        assert!(last_page(99, 100));
-        assert!(!last_page(100, 100));
-        assert!(!last_page(101, 100));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use serde_json::{Map, Value};
+use std::sync::LazyLock;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct JobLead {
@@ -87,10 +88,8 @@ pub fn string(value: Option<&Value>) -> String {
 }
 
 pub fn object(value: &Value) -> &Map<String, Value> {
-    value.as_object().unwrap_or_else(|| {
-        static EMPTY: std::sync::OnceLock<Map<String, Value>> = std::sync::OnceLock::new();
-        EMPTY.get_or_init(Map::new)
-    })
+    static EMPTY: LazyLock<Map<String, Value>> = LazyLock::new(Map::new);
+    value.as_object().unwrap_or(&EMPTY)
 }
 
 pub fn strings(value: Option<&Value>) -> Vec<String> {

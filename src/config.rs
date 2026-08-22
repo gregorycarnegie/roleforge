@@ -1,7 +1,7 @@
 use crate::Result;
 use crate::model::{ResumeProfile, RoleProfile, SearchConfig, object, string, strings};
 use crate::text::{dedupe, normalize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -33,6 +33,11 @@ pub fn load_dotenv(path: impl AsRef<Path>) -> Result<()> {
     Ok(())
 }
 
+/// A nested object, or an empty map when the key is absent or the wrong shape.
+fn section<'a>(parent: &'a Map<String, Value>, key: &str) -> &'a Map<String, Value> {
+    object(parent.get(key).unwrap_or(&Value::Null))
+}
+
 fn read_json(path: impl AsRef<Path>) -> Result<Value> {
     Ok(serde_json::from_str(&fs::read_to_string(path)?)?)
 }
@@ -40,22 +45,10 @@ fn read_json(path: impl AsRef<Path>) -> Result<Value> {
 pub fn load_resume(path: impl AsRef<Path>) -> Result<ResumeProfile> {
     let raw = read_json(path)?;
     let root = object(&raw);
-    let personal = root
-        .get("personal_info")
-        .map(object)
-        .unwrap_or_else(|| object(&Value::Null));
-    let location = personal
-        .get("location")
-        .map(object)
-        .unwrap_or_else(|| object(&Value::Null));
-    let prefs = personal
-        .get("preferences")
-        .map(object)
-        .unwrap_or_else(|| object(&Value::Null));
-    let technical = root
-        .get("technical_skills")
-        .map(object)
-        .unwrap_or_else(|| object(&Value::Null));
+    let personal = section(root, "personal_info");
+    let location = section(personal, "location");
+    let prefs = section(personal, "preferences");
+    let technical = section(root, "technical_skills");
 
     let preferred_locations = dedupe(
         strings(prefs.get("preferred_locations"))

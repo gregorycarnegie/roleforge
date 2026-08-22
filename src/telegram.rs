@@ -6,7 +6,14 @@ use std::collections::HashSet;
 use std::env;
 use std::time::Duration;
 
-pub fn settings() -> (String, String, String) {
+pub fn token() -> String {
+    env::var("TELEGRAM_BOT_TOKEN")
+        .unwrap_or_default()
+        .trim()
+        .into()
+}
+
+fn settings() -> (String, String, String) {
     (
         env::var("TELEGRAM_BOT_TOKEN")
             .unwrap_or_default()
@@ -233,7 +240,7 @@ pub fn parse_digest_callback(value: &str) -> Option<(&str, &str)> {
 }
 
 pub fn process_updates(db: &Database, timeout: u64) -> Result<usize> {
-    let (token, _, _) = settings();
+    let token = token();
     if token.is_empty() {
         return Err("TELEGRAM_BOT_TOKEN not configured".into());
     }
