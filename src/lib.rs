@@ -1,3 +1,4 @@
+pub mod card;
 pub mod config;
 pub mod matching;
 pub mod model;
