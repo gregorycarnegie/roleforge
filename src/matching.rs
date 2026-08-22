@@ -16,11 +16,128 @@ pub struct SalaryInfo {
     pub max_gbp: i64,
 }
 
-pub fn location_fit(
-    text: &str,
-    profile: &ResumeProfile,
-    lockouts: &[String],
-) -> (bool, &'static str) {
+/// Aliases that stand in for one place. A posting scoped to any alias of a
+/// group the candidate did not ask for is out of reach; Europe/EMEA are
+/// deliberately absent, being neither a restriction nor a permission on their
+/// own.
+///
+/// ponytail: hand-written list, swap for a gazetteer if feeds get exotic.
+const REGIONS: [&[&str]; 13] = [
+    &[
+        "united kingdom",
+        "uk",
+        "britain",
+        "england",
+        "scotland",
+        "wales",
+        "london",
+    ],
+    &[
+        "united states",
+        "usa",
+        "us",
+        "america",
+        "americas",
+        "new york",
+        "california",
+        "texas",
+    ],
+    &[
+        "canada",
+        "ontario",
+        "toronto",
+        "vancouver",
+        "quebec",
+        "british columbia",
+    ],
+    &["germany", "berlin", "frankfurt", "munich", "hamburg"],
+    &["france", "paris"],
+    &["spain", "madrid", "barcelona"],
+    &["netherlands", "amsterdam"],
+    &["ireland", "dublin"],
+    &["poland", "warsaw", "krakow"],
+    &["india", "bangalore", "bengaluru", "mumbai", "hyderabad"],
+    &["australia", "sydney", "melbourne"],
+    &["singapore"],
+    &["philippines", "manila"],
+];
+
+/// Words that turn a place name into a scope. "Berlin" alone is a mention;
+/// "remote - Berlin" is a restriction.
+const SCOPE: &str = r"remote|hybrid|onsite|on site|based|located|reside|residing|residents?|eligible|authori[sz]ed|headquarters|hq|within";
+/// Words allowed to sit between the scope word and the place name.
+const FILLER: &str = r"in|the|to|for|from|candidates?|applicants?|position|role|open|must|be|is|anywhere|located|only";
+
+fn alternation(terms: &[String]) -> Option<String> {
+    (!terms.is_empty()).then(|| {
+        terms
+            .iter()
+            .map(|term| regex::escape(term).replace(r"\ ", r"\s+"))
+            .collect::<Vec<_>>()
+            .join("|")
+    })
+}
+
+fn compile(pattern: Option<String>) -> Option<Regex> {
+    // Every alternative is escaped, so this cannot fail.
+    pattern.map(|pattern| Regex::new(&pattern).expect("escaped alternation is a valid pattern"))
+}
+
+fn matches(pattern: &Option<Regex>, context: &str) -> bool {
+    pattern
+        .as_ref()
+        .is_some_and(|regex| regex.is_match(context))
+}
+
+/// Which places a posting may restrict itself to, compiled once per run.
+pub struct Geo {
+    /// Exclusive wording ("US only"): rejects however welcoming the rest reads.
+    hard: Option<Regex>,
+    /// Scoped wording ("Remote (United States)"): rejects unless the posting
+    /// also names somewhere the candidate can work.
+    soft: Option<Regex>,
+    /// Anywhere the candidate can work, preferences plus their aliases.
+    home: Option<Regex>,
+}
+
+impl Geo {
+    pub fn new(profile: &ResumeProfile) -> Self {
+        let preferred = |group: &[&str]| {
+            group.iter().any(|alias| {
+                profile
+                    .preferred_locations
+                    .iter()
+                    .any(|item| item == *alias)
+            })
+        };
+        let (mut home, mut foreign) = (profile.preferred_locations.clone(), vec![]);
+        for group in REGIONS {
+            let bucket = if preferred(group) {
+                &mut home
+            } else {
+                &mut foreign
+            };
+            bucket.extend(group.iter().map(|alias| (*alias).to_owned()));
+        }
+        let foreign = alternation(&dedupe(foreign));
+        Self {
+            hard: compile(foreign.as_ref().map(|places| {
+                format!(
+                    r"(?i)(?:^|\W)(?:(?:{places})\W+(?:residents?\W+)?only|only\W+(?:in\W+)?(?:{places}))(?:$|\W)"
+                )
+            })),
+            soft: compile(foreign.map(|places| {
+                format!(r"(?i)(?:^|\W)(?:{SCOPE})\W+(?:(?:{FILLER})\W+){{0,4}}(?:{places})(?:$|\W)")
+            })),
+            home: compile(
+                alternation(&dedupe(home))
+                    .map(|places| format!(r"(?i)(?:^|\W)(?:{places})(?:$|\W)")),
+            ),
+        }
+    }
+}
+
+pub fn location_fit(text: &str, profile: &ResumeProfile, geo: &Geo) -> (bool, &'static str) {
     let context: String = normalize(text).chars().take(1000).collect();
     let remote = ["remote", "anywhere", "wfh"]
         .iter()
@@ -40,8 +157,9 @@ pub fn location_fit(
     let local = profile
         .preferred_locations
         .iter()
-        .any(|term| context.contains(term));
-    let locked = lockouts.iter().any(|term| context.contains(term));
+        .any(|term| contains_phrase(&context, term));
+    let locked = matches(&geo.hard, &context)
+        || (matches(&geo.soft, &context) && !matches(&geo.home, &context));
     if profile.relocation {
         (true, "location fit: relocation allowed")
     } else if profile.remote && remote && !locked {
@@ -284,7 +402,7 @@ pub fn score_job(
     profile: &ResumeProfile,
     config: &SearchConfig,
     timestamp: &str,
-    lockouts: &[String],
+    geo: &Geo,
 ) -> MatchResult {
     let title = clean(&item.title);
     let description = clean(&item.description);
@@ -293,7 +411,7 @@ pub fn score_job(
         item.location, item.employment_type
     );
     let mut reasons = vec![];
-    let (location_ok, location_reason) = location_fit(&full, profile, lockouts);
+    let (location_ok, location_reason) = location_fit(&full, profile, geo);
     push_reason(&mut reasons, location_reason);
     if !location_ok {
         return MatchResult {
@@ -579,7 +697,7 @@ mod tests {
             &profile(),
             &search(),
             "2026-01-01T00:00:00Z",
-            &[],
+            &Geo::new(&profile()),
         )
     }
 
@@ -660,20 +778,20 @@ mod tests {
             ..ResumeProfile::default()
         };
         assert_eq!(
-            location_fit("Remote UK", &remote_only, &[]),
+            location_fit("Remote UK", &remote_only, &Geo::new(&remote_only)),
             (true, "location fit: remote compatible")
         );
         assert_eq!(
-            location_fit("Remote US only", &remote_only, &["us only".into()]),
+            location_fit("Remote US only", &remote_only, &Geo::new(&remote_only)),
             (false, "location reject: explicit geographic lockout")
         );
         assert_eq!(
-            location_fit("Onsite in Berlin", &remote_only, &[]),
-            (false, "location reject: not aligned with preferences")
+            location_fit("Onsite in Berlin", &remote_only, &Geo::new(&remote_only)),
+            (false, "location reject: explicit geographic lockout")
         );
         // "wfh" and "anywhere" are remote too; "remotely" is not a whole phrase.
-        assert!(location_fit("WFH available", &remote_only, &[]).0);
-        assert!(location_fit("Work from anywhere", &remote_only, &[]).0);
+        assert!(location_fit("WFH available", &remote_only, &Geo::new(&remote_only)).0);
+        assert!(location_fit("Work from anywhere", &remote_only, &Geo::new(&remote_only)).0);
     }
 
     #[test]
@@ -683,7 +801,7 @@ mod tests {
             ..ResumeProfile::default()
         };
         assert_eq!(
-            location_fit("Onsite in Tokyo, US only", &anywhere, &["us only".into()]),
+            location_fit("Onsite in Tokyo, US only", &anywhere, &Geo::new(&anywhere)),
             (true, "location fit: relocation allowed")
         );
     }
@@ -696,22 +814,26 @@ mod tests {
             ..ResumeProfile::default()
         };
         assert_eq!(
-            location_fit("Hybrid role, remote friendly, London", &hybrid, &[]),
+            location_fit(
+                "Hybrid role, remote friendly, London",
+                &hybrid,
+                &Geo::new(&hybrid)
+            ),
             (true, "location fit: local/hybrid compatible")
         );
         // No hybrid wording and no remote wording: still local, so still a fit.
         assert_eq!(
-            location_fit("London based role", &hybrid, &[]),
+            location_fit("London based role", &hybrid, &Geo::new(&hybrid)),
             (true, "location fit: local/hybrid compatible")
         );
         // Remote-only wording with no hybrid wording is not a hybrid fit.
         assert_eq!(
-            location_fit("Fully remote, anywhere", &hybrid, &[]),
+            location_fit("Fully remote, anywhere", &hybrid, &Geo::new(&hybrid)),
             (false, "location reject: not aligned with preferences")
         );
         // Hybrid, but somewhere else.
         assert_eq!(
-            location_fit("Hybrid role in Manchester", &hybrid, &[]),
+            location_fit("Hybrid role in Manchester", &hybrid, &Geo::new(&hybrid)),
             (false, "location reject: not aligned with preferences")
         );
 
@@ -721,16 +843,20 @@ mod tests {
             ..ResumeProfile::default()
         };
         assert_eq!(
-            location_fit("On-site, London, remote occasionally", &onsite, &[]),
+            location_fit(
+                "On-site, London, remote occasionally",
+                &onsite,
+                &Geo::new(&onsite)
+            ),
             (true, "location fit: local/onsite compatible")
         );
         assert_eq!(
-            location_fit("Fully remote, anywhere", &onsite, &[]),
+            location_fit("Fully remote, anywhere", &onsite, &Geo::new(&onsite)),
             (false, "location reject: not aligned with preferences")
         );
         // Neither onsite nor remote wording: local alone carries it.
         assert_eq!(
-            location_fit("London based role", &onsite, &[]),
+            location_fit("London based role", &onsite, &Geo::new(&onsite)),
             (true, "location fit: local/onsite compatible")
         );
         // A profile with none of the three modes set never fits.
@@ -739,7 +865,7 @@ mod tests {
             ..ResumeProfile::default()
         };
         assert_eq!(
-            location_fit("London based role", &picky, &[]),
+            location_fit("London based role", &picky, &Geo::new(&picky)),
             (false, "location reject: not aligned with preferences")
         );
     }
@@ -750,7 +876,6 @@ mod tests {
     #[test]
     fn lockout_overrides_hybrid_and_onsite_fit() {
         let text = "Hybrid role in our London office. Remote US only.";
-        let lockouts = ["us only".to_owned(), "remote us".to_owned()];
         for profile in [
             ResumeProfile {
                 hybrid: true,
@@ -764,10 +889,45 @@ mod tests {
             },
         ] {
             assert_eq!(
-                location_fit(text, &profile, &lockouts),
+                location_fit(text, &profile, &Geo::new(&profile)),
                 (false, "location reject: explicit geographic lockout")
             );
         }
+    }
+
+    // Regression: these three all qualified against a London profile in a live
+    // run, because the lockout was a raw substring of glue phrases and the
+    // punctuation in "Remote (United States)" broke every one of them.
+    #[test]
+    fn scoped_remote_postings_elsewhere_are_rejected() {
+        let londoner = ResumeProfile {
+            remote: true,
+            hybrid: true,
+            onsite: true,
+            preferred_locations: vec!["london".into(), "united kingdom".into()],
+            ..ResumeProfile::default()
+        };
+        let geo = Geo::new(&londoner);
+        for text in [
+            "Location: Remote (United States). Fully remote position.",
+            "This is a fully remote position open to candidates within the United States.",
+            "Senior Application Support Engineer (Remote Ontario)",
+            "Remote - Frankfurt, hybrid options available",
+        ] {
+            assert_eq!(
+                location_fit(text, &londoner, &geo),
+                (false, "location reject: explicit geographic lockout"),
+                "{text}"
+            );
+        }
+        // A remote posting that also names somewhere reachable still fits, and
+        // "UK" counts even though the resume spells it "United Kingdom".
+        assert_eq!(
+            location_fit("Headquarters: Remote - Canada, France, UK", &londoner, &geo),
+            (true, "location fit: remote compatible")
+        );
+        // Naming a place without scoping wording is a mention, not a lockout.
+        assert!(location_fit("Remote. We have a Berlin office too.", &londoner, &geo).0);
     }
 
     #[test]
@@ -777,8 +937,8 @@ mod tests {
             ..ResumeProfile::default()
         };
         let padded = format!("{}remote", "x ".repeat(600));
-        assert!(!location_fit(&padded, &profile, &[]).0);
-        assert!(location_fit("remote", &profile, &[]).0);
+        assert!(!location_fit(&padded, &profile, &Geo::new(&profile)).0);
+        assert!(location_fit("remote", &profile, &Geo::new(&profile)).0);
     }
 
     // --- company ---------------------------------------------------------
@@ -978,7 +1138,7 @@ mod tests {
             &profile,
             &search(),
             "2026-01-01T00:00:00Z",
-            &[],
+            &Geo::new(&profile),
         );
         // The reject reason itself is covered where it is produced, by the
         // location_fit tests above.
@@ -1077,7 +1237,16 @@ mod tests {
             ..ResumeProfile::default()
         };
         let plain = SearchConfig::default();
-        let note = |item: &JobLead| reasons(&score_job(item, "feed", &lean, &plain, "t", &[]));
+        let note = |item: &JobLead| {
+            reasons(&score_job(
+                item,
+                "feed",
+                &lean,
+                &plain,
+                "t",
+                &Geo::new(&lean),
+            ))
+        };
         assert_eq!(
             note(&low),
             [
@@ -1111,8 +1280,16 @@ mod tests {
         // With no stated preference, salary moves neither score nor reasons.
         let mut no_preference = lean.clone();
         no_preference.minimum_salary_gbp = 0;
-        let quiet =
-            |item: &JobLead| reasons(&score_job(item, "feed", &no_preference, &plain, "t", &[]));
+        let quiet = |item: &JobLead| {
+            reasons(&score_job(
+                item,
+                "feed",
+                &no_preference,
+                &plain,
+                "t",
+                &Geo::new(&no_preference),
+            ))
+        };
         for item in [&low, &high, &exact] {
             assert_eq!(
                 quiet(item),
@@ -1138,7 +1315,14 @@ mod tests {
             "alpha one delta epsilon",
             "Remote. alpha one, beta two and gamma three. zeta and eta.",
         );
-        let result = score_job(&item, "feed", &counted, &SearchConfig::default(), "t", &[]);
+        let result = score_job(
+            &item,
+            "feed",
+            &counted,
+            &SearchConfig::default(),
+            "t",
+            &Geo::new(&counted),
+        );
         // 34 (one target role in the title, no per-extra bonus)
         // + 18 (two more in the description, capped)
         // + 12 (two skills in the title) + 6 (two competencies).
@@ -1165,7 +1349,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         let item = lead(&title, "Remote.");
-        let capped = score_job(&item, "feed", &wide, &search(), "t", &[]);
+        let capped = score_job(&item, "feed", &wide, &search(), "t", &Geo::new(&wide));
         // find_matches stops at 3, so the title bonus saturates at 34 + 7 * 2.
         assert!(
             reasons(&capped)

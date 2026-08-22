@@ -1,8 +1,8 @@
 use crate::{
     Result,
     config::{self, BORDERLINE_MARGIN, MIN_MATCH_SCORE, STATE_DB},
-    matching::score_job,
-    model::{ResumeProfile, string},
+    matching::{Geo, score_job},
+    model::string,
     sources,
     storage::{self, Database, FeedState, JobRow},
     telegram,
@@ -38,17 +38,7 @@ pub fn pull() -> Result<()> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs_f64();
     let mut all_sources = config::built_in_sources();
     all_sources.extend(config::load_company_boards("company_boards.json")?);
-    let regions = [
-        "us",
-        "usa",
-        "united states",
-        "uk",
-        "united kingdom",
-        "canada",
-        "europe",
-        "americas",
-    ];
-    let lockouts = lockouts(&regions, &profile);
+    let geo = Geo::new(&profile);
     let mut matches = vec![];
     let mut borderline = vec![];
     let mut new_rows = vec![];
@@ -82,7 +72,7 @@ pub fn pull() -> Result<()> {
                     {
                         continue;
                     }
-                    let result = score_job(&item, &label, &profile, &search, &timestamp, &lockouts);
+                    let result = score_job(&item, &label, &profile, &search, &timestamp, &geo);
                     db.append_reviewed(&fingerprints, 50_000)?;
                     reviewed += 1;
                     if let Some(candidate) = result.candidate.clone() {
@@ -352,21 +342,6 @@ pub fn run() -> Result<()> {
     }
 }
 
-/// Region phrases the candidate has not asked for. A posting carrying one is
-/// restricted to somewhere they cannot work.
-fn lockouts(regions: &[&str], profile: &ResumeProfile) -> Vec<String> {
-    regions
-        .iter()
-        .filter(|region| {
-            !profile
-                .preferred_locations
-                .iter()
-                .any(|item| item == **region)
-        })
-        .flat_map(|region| [format!("{region} only"), format!("remote {region}")])
-        .collect()
-}
-
 /// Sources may state their polling interval as either JSON number type.
 fn feed_interval(source: &Value) -> f64 {
     source
@@ -502,24 +477,6 @@ mod tests {
         assert!(!digest_due(&json!({"hour_utc": 0}), &today));
         // Defaults: enabled, and the 07:00 hour, so only the date is asserted.
         assert!(!digest_due(&json!({}), &today));
-    }
-
-    #[test]
-    fn lockouts_cover_every_region_not_asked_for() {
-        let profile = ResumeProfile {
-            preferred_locations: vec!["uk".into(), "europe".into()],
-            ..ResumeProfile::default()
-        };
-        assert_eq!(
-            lockouts(&["uk", "us", "europe"], &profile),
-            ["us only", "remote us"]
-        );
-        // Nothing preferred means everything is a lockout.
-        assert_eq!(
-            lockouts(&["us"], &ResumeProfile::default()),
-            ["us only", "remote us"]
-        );
-        assert!(lockouts(&[], &profile).is_empty());
     }
 
     #[test]
