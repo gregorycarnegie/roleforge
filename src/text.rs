@@ -1,7 +1,10 @@
 use quick_xml::escape::unescape;
 use regex::Regex;
 use sha2::{Digest, Sha256};
-use std::{collections::HashSet, sync::LazyLock};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{LazyLock, Mutex},
+};
 use url::Url;
 
 static TAGS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<[^>]+>").expect("valid tag regex"));
@@ -28,16 +31,34 @@ pub fn or_fallback(value: String, fallback: &str) -> String {
     }
 }
 
+/// Compiled phrase patterns, keyed on the normalized phrase. Scoring one job
+/// tests the same few dozen phrases against several fields, and the phrase set
+/// is fixed by the resume and the weight tables, so this stops growing after
+/// the first job. Building these was ~70% of scoring CPU before it was cached.
+///
+/// ponytail: one global lock, per-thread caches if scoring ever goes parallel.
+static PHRASE_PATTERNS: LazyLock<Mutex<HashMap<String, Regex>>> = LazyLock::new(Mutex::default);
+
 pub fn contains_phrase(haystack: &str, phrase: &str) -> bool {
     let phrase = normalize(phrase);
     if phrase.is_empty() {
         return false;
     }
-    let pattern = format!(
-        r"(?i)(?:^|\W){}(?:$|\W)",
-        regex::escape(&phrase).replace(r"\ ", r"\s+")
-    );
-    Regex::new(&pattern).is_ok_and(|re| re.is_match(&normalize(haystack)))
+    let haystack = normalize(haystack);
+    let mut patterns = PHRASE_PATTERNS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    patterns
+        .entry(phrase)
+        .or_insert_with_key(|phrase| {
+            let pattern = format!(
+                r"(?i)(?:^|\W){}(?:$|\W)",
+                regex::escape(phrase).replace(r"\ ", r"\s+")
+            );
+            // The phrase is escaped, so this cannot fail.
+            Regex::new(&pattern).expect("escaped phrase is a valid pattern")
+        })
+        .is_match(&haystack)
 }
 
 pub fn find_matches(text: &str, phrases: &[String], limit: usize) -> Vec<String> {
