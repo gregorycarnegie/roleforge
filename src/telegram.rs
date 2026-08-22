@@ -249,7 +249,9 @@ pub fn queue_alerts(state: &mut Value, matches: &[Value]) -> usize {
     count
 }
 
-pub fn deliver_alerts(state: &mut Value, timestamp: &str) -> (usize, String) {
+/// Each delivery is recorded before the next one is attempted: a crash
+/// part-way through would otherwise resend everything already sent.
+pub fn deliver_alerts(db: &mut Database, state: &mut Value, timestamp: &str) -> (usize, String) {
     let pending = state["pending_alerts"]
         .as_array()
         .cloned()
@@ -294,6 +296,9 @@ pub fn deliver_alerts(state: &mut Value, timestamp: &str) -> (usize, String) {
                 sent += 1;
                 state["last_delivery_utc"] = Value::String(timestamp.into());
                 state["last_delivery_error"] = Value::String(String::new());
+                if let Err(error) = db.save_alert_state(state) {
+                    return (sent, error.to_string());
+                }
             }
             Err(error) => {
                 let message = error.to_string();
@@ -565,8 +570,10 @@ mod tests {
 
     #[test]
     fn deliver_alerts_is_a_no_op_with_an_empty_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Database::open(dir.path().join("roleforge.sqlite3")).unwrap();
         let mut state = json!({"pending_alerts": [], "alerted_links": []});
-        assert_eq!(deliver_alerts(&mut state, "t"), (0, String::new()));
+        assert_eq!(deliver_alerts(&mut db, &mut state, "t"), (0, String::new()));
         assert!(state.get("last_delivery_utc").is_none());
     }
 

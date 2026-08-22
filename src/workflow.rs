@@ -2,7 +2,7 @@ use crate::{
     Result,
     config::{self, BORDERLINE_MARGIN, MIN_MATCH_SCORE, STATE_DB},
     matching::{Geo, score_job},
-    model::string,
+    model::{JobLead, string},
     sources,
     storage::{self, Database, FeedState, JobRow},
     telegram,
@@ -20,6 +20,14 @@ use std::{
 };
 
 pub fn pull() -> Result<()> {
+    let mut all_sources = config::built_in_sources();
+    all_sources.extend(config::load_company_boards("company_boards.json")?);
+    sweep(&all_sources, sources::fetch)
+}
+
+/// The sweep itself, with the source list and the fetcher passed in so a test
+/// can drive the whole path without a network.
+fn sweep(all_sources: &[Value], fetch: impl Fn(&Value) -> Result<Vec<JobLead>>) -> Result<()> {
     let timestamp = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let profile = config::load_resume("resume.json")?;
     let search = config::load_search_config("job_search_config.json")?;
@@ -36,12 +44,15 @@ pub fn pull() -> Result<()> {
 
     let mut state = db.feed_state()?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs_f64();
-    let mut all_sources = config::built_in_sources();
-    all_sources.extend(config::load_company_boards("company_boards.json")?);
     let geo = Geo::new(&profile);
     let mut matches = vec![];
     let mut borderline = vec![];
     let mut new_rows = vec![];
+    let mut new_applications = vec![];
+    // Held until the batch commits: a fingerprint written ahead of the job it
+    // came from would hide that job for good on the next run.
+    let mut pending_reviewed: Vec<String> = vec![];
+    let mut seen_reviewed: HashSet<String> = HashSet::new();
     let mut reviewed = 0;
 
     for source in all_sources {
@@ -49,11 +60,13 @@ pub fn pull() -> Result<()> {
         if name.is_empty() {
             continue;
         }
-        if !feed_due(state.get(&name), now, feed_interval(&source)) {
+        if !feed_due(state.get(&name), now, feed_interval(source))
+            || !sources::is_configured(source)
+        {
             continue;
         }
         let label = or_fallback(string(source.get("display_name")), &name);
-        match sources::fetch(&source) {
+        match fetch(source) {
             Ok(items) => {
                 state.insert(
                     name,
@@ -68,12 +81,14 @@ pub fn pull() -> Result<()> {
                     // A linkless lead cannot be deduplicated or applied to.
                     if item.link.is_empty()
                         || links.contains(&item.link)
+                        || fingerprints.iter().any(|fp| seen_reviewed.contains(fp))
                         || db.has_reviewed(&fingerprints)?
                     {
                         continue;
                     }
                     let result = score_job(&item, &label, &profile, &search, &timestamp, &geo);
-                    db.append_reviewed(&fingerprints, 50_000)?;
+                    seen_reviewed.extend(fingerprints.iter().cloned());
+                    pending_reviewed.extend(fingerprints.iter().cloned());
                     reviewed += 1;
                     if let Some(candidate) = result.candidate.clone() {
                         if result.qualified {
@@ -84,7 +99,7 @@ pub fn pull() -> Result<()> {
                             application["review_fingerprints"] =
                                 serde_json::to_value(&fingerprints)?;
                             application["links"] = json!([item.link]);
-                            db.upsert_application(&application)?;
+                            new_applications.push(application);
                             matches.push(candidate);
                             new_rows.push(JobRow {
                                 time: timestamp.clone(),
@@ -110,7 +125,15 @@ pub fn pull() -> Result<()> {
         }
     }
 
-    db.append_jobs(&new_rows)?;
+    // Order is the durability contract. The alert queue is made durable first,
+    // then the batch commits the jobs, applications and their fingerprints
+    // together. A crash anywhere before that last commit replays the whole
+    // batch, and queue_alerts deduplicates what is already pending.
+    let mut alerts = db.alert_state()?;
+    let queued = telegram::queue_alerts(&mut alerts, &matches);
+    alerts["last_run_utc"] = Value::String(timestamp.clone());
+    db.save_alert_state(&alerts)?;
+    db.commit_batch(&new_rows, &new_applications, &pending_reviewed, 50_000)?;
     db.save_feed_state(&state)?;
     let all_jobs = db.jobs()?;
     storage::export_csv("jobs.csv", &all_jobs)?;
@@ -141,10 +164,7 @@ pub fn pull() -> Result<()> {
     )?;
     db.save_applications_state(&applications)?;
 
-    let mut alerts = db.alert_state()?;
-    let queued = telegram::queue_alerts(&mut alerts, &matches);
-    let (sent, delivery_error) = telegram::deliver_alerts(&mut alerts, &timestamp);
-    alerts["last_run_utc"] = Value::String(timestamp.clone());
+    let (sent, delivery_error) = telegram::deliver_alerts(&mut db, &mut alerts, &timestamp);
     db.save_alert_state(&alerts)?;
     storage::write_json("alerts_state.json", &alerts)?;
     storage::write_json("feed_state.json", &serde_json::to_value(state.iter().map(|(name,value)| (name.clone(),json!({"last_checked_at":value.last_checked_at,"consecutive_failures":value.consecutive_failures}))).collect::<serde_json::Map<_,_>>())?)?;
@@ -386,6 +406,165 @@ pub fn digest_due(config: &Value, last_date: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
+
+    const RESUME: &str = r#"{
+        "personal_info": {
+            "location": {"city": "London", "country": "United Kingdom"},
+            "target_roles": ["IT Support Engineer"],
+            "preferences": {
+                "remote": true, "hybrid": true, "onsite": true,
+                "minimum_salary_gbp": 40000
+            }
+        },
+        "technical_skills": {
+            "skills": ["Intune", "Active Directory"],
+            "competencies": ["stakeholder management"]
+        },
+        "experience": [
+            {"title": "IT Support Engineer", "company": "Initech",
+             "responsibilities": ["Rolled out Intune to 900 devices"]}
+        ]
+    }"#;
+
+    // hour_utc 0 keeps the digest deterministic: it is always due, so the run
+    // exercises that path on every sweep rather than only after 07:00 UTC.
+    const SEARCH: &str = r#"{
+        "company_whitelist": ["acme"],
+        "daily_digest": {"enabled": true, "hour_utc": 0}
+    }"#;
+
+    fn matching_lead() -> JobLead {
+        JobLead {
+            title: "IT Support Engineer".into(),
+            link: "https://example.com/jobs/1".into(),
+            company: "Acme Ltd".into(),
+            location: "London".into(),
+            salary: "£45,000 - £55,000 per year".into(),
+            employment_type: "Permanent".into(),
+            description: "Hybrid in London. Intune and Active Directory estate,                           ticket management and stakeholder management."
+                .into(),
+            ..JobLead::default()
+        }
+    }
+
+    /// The orchestration path, end to end, with the network replaced by a
+    /// closure: collection, scoring, the batch commit, every export, the
+    /// digest, and the alert outbox surviving a failed delivery.
+    #[test]
+    fn a_sweep_persists_its_batch_and_replays_the_alert_it_could_not_deliver() {
+        let _guard = crate::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        // SAFETY: the lock keeps the other environment tests out, and no
+        // worker threads run here. Unset, every Telegram call fails before it
+        // reaches the network, which is the delivery failure under test.
+        unsafe {
+            env::remove_var("TELEGRAM_BOT_TOKEN");
+            env::remove_var("TELEGRAM_CHAT_ID");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("resume.json"), RESUME).unwrap();
+        fs::write(dir.path().join("job_search_config.json"), SEARCH).unwrap();
+        // Interval zero so the second sweep polls again instead of waiting an
+        // hour: the deduplication under test is the fingerprint, not the clock.
+        let feed = json!({"name": "fake", "display_name": "Fake Board", "min_interval_seconds": 0});
+        let broken = json!({"name": "dead", "min_interval_seconds": 0});
+
+        let lead = matching_lead();
+        let fingerprints = review_fingerprints(&lead.title, &lead.description, &lead.link);
+
+        let previous = env::current_dir().unwrap();
+        env::set_current_dir(dir.path()).unwrap();
+        let first = sweep(std::slice::from_ref(&feed), |_| Ok(vec![matching_lead()]));
+        // Read between the sweeps: the second one's backfill re-derives a
+        // fingerprint for every stored job, and would mask a first sweep that
+        // never recorded one.
+        let reviewed_after_first =
+            Database::open(dir.path().join(STATE_DB)).and_then(|db| db.has_reviewed(&fingerprints));
+        // The same posting again, alongside a source that is down.
+        let second = sweep(&[feed, broken], |source| {
+            match string(source.get("name")).as_str() {
+                "dead" => Err("connection refused".into()),
+                _ => Ok(vec![matching_lead()]),
+            }
+        });
+        // The other entry point, against the database the sweep just wrote.
+        let staged = export_latest();
+        env::set_current_dir(previous).unwrap();
+        first.unwrap();
+        assert!(reviewed_after_first.unwrap());
+        second.unwrap();
+        staged.unwrap();
+
+        let db = Database::open(dir.path().join(STATE_DB)).unwrap();
+        // Seen twice, stored once.
+        let jobs = db.jobs().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].lead.title, "IT Support Engineer");
+
+        let applications = db.applications_state().unwrap();
+        let stored = applications["applications"].as_array().unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0]["status"], "new");
+        assert_eq!(stored[0]["company"], "Acme Ltd");
+        assert_eq!(stored[0]["source"], "Fake Board");
+        assert!(stored[0]["score"].as_i64().unwrap() >= MIN_MATCH_SCORE);
+        // The digest ran and recorded why it could not be sent.
+        assert!(
+            applications["last_digest_error"]
+                .as_str()
+                .unwrap()
+                .contains("TELEGRAM_BOT_TOKEN")
+        );
+
+        // The undeliverable alert is still queued, exactly once, after a
+        // second sweep that found nothing new.
+        let alerts = db.alert_state().unwrap();
+        assert_eq!(alerts["pending_alerts"].as_array().unwrap().len(), 1);
+        assert_eq!(alerts["pending_alerts"][0]["link"], jobs[0].lead.link);
+        assert_eq!(alerts["alerted_links"], json!([]));
+        assert!(
+            alerts["last_delivery_error"]
+                .as_str()
+                .unwrap()
+                .contains("TELEGRAM_BOT_TOKEN")
+        );
+
+        // The dead source is counted, not fatal, and never marked as polled.
+        let state = db.feed_state().unwrap();
+        assert_eq!(state["dead"].consecutive_failures, 1);
+        assert_eq!(state["dead"].last_checked_at, 0.0);
+        assert_eq!(state["fake"].consecutive_failures, 0);
+
+        let csv = fs::read_to_string(dir.path().join("jobs.csv")).unwrap();
+        assert_eq!(csv.lines().count(), 2);
+        assert!(csv.contains("https://example.com/jobs/1"), "{csv}");
+        for name in [
+            "matches.json",
+            "borderline_matches.json",
+            "applications.json",
+            "daily_digest.json",
+            "application_briefs.json",
+            "alerts_state.json",
+            "feed_state.json",
+        ] {
+            assert!(dir.path().join(name).exists(), "{name} was not written");
+        }
+        // The second sweep found nothing, so the newest matches file is empty.
+        let matches: Value =
+            serde_json::from_str(&fs::read_to_string(dir.path().join("matches.json")).unwrap())
+                .unwrap();
+        assert_eq!(matches["matches"], json!([]));
+
+        // export_latest stages the newest stored batch for the OpenClaw prompt.
+        let staged: Value =
+            serde_json::from_str(&fs::read_to_string(dir.path().join("desc.json")).unwrap())
+                .unwrap();
+        assert_eq!(staged.as_array().unwrap().len(), 1);
+        assert_eq!(staged[0]["link"], "https://example.com/jobs/1");
+        assert_eq!(staged[0]["title"], "IT Support Engineer");
+    }
 
     fn application(link: &str, status: &str, score: i64, shortlisted: bool) -> Value {
         json!({"link": link, "status": status, "score": score, "shortlisted": shortlisted})

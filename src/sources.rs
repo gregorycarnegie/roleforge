@@ -5,7 +5,7 @@ use crate::{
 };
 use quick_xml::{Reader, events::Event};
 use regex::Regex;
-use reqwest::blocking::{Client, RequestBuilder};
+use reqwest::blocking::{Client, RequestBuilder, Response};
 use serde_json::{Value, json};
 use std::{collections::HashSet, env, sync::LazyLock, time::Duration};
 use url::Url;
@@ -19,12 +19,38 @@ fn client() -> Result<Client> {
         .build()?)
 }
 
+/// reqwest embeds the request URL in every error it produces, and some of
+/// ours carry an API key in the path or the query string. Those errors get
+/// logged and stored, so the URL is dropped before it can escape.
 fn fetch_text(request: RequestBuilder) -> Result<String> {
-    Ok(request.send()?.error_for_status()?.text()?)
+    Ok(request
+        .send()
+        .and_then(Response::error_for_status)
+        .and_then(Response::text)
+        .map_err(reqwest::Error::without_url)?)
 }
 
 fn fetch_json(request: RequestBuilder) -> Result<Value> {
-    Ok(request.send()?.error_for_status()?.json()?)
+    Ok(request
+        .send()
+        .and_then(Response::error_for_status)
+        .and_then(|response| response.json())
+        .map_err(reqwest::Error::without_url)?)
+}
+
+/// A source needing credentials stays off until they exist, rather than
+/// failing on every poll and eventually alerting about it.
+pub fn is_configured(config: &Value) -> bool {
+    match cfg(config, "type").as_str() {
+        "adzuna" => required_env("ADZUNA_APP_ID").is_ok() && required_env("ADZUNA_APP_KEY").is_ok(),
+        "reed" => required_env("REED_APP_KEY").is_ok(),
+        "jooble" => required_env("JOOBLE_APP_KEY").is_ok(),
+        _ => {
+            cfg(config, "platform") != "workable"
+                || cfg(config, "mode") != "spi"
+                || required_env(&cfg(config, "api_token_env")).is_ok()
+        }
+    }
 }
 
 fn cfg(config: &Value, key: &str) -> String {
@@ -258,7 +284,7 @@ fn generic_html(config: &Value) -> Result<Vec<JobLead>> {
     let urls = start_urls(config);
     let source = display_name(config);
     let company = display_name(config);
-    let allowed_domains: Vec<String> = config
+    let mut allowed_domains: Vec<String> = config
         .get("allowed_domains")
         .and_then(Value::as_array)
         .into_iter()
@@ -266,6 +292,11 @@ fn generic_html(config: &Value) -> Result<Vec<JobLead>> {
         .filter_map(Value::as_str)
         .map(|domain| domain.trim().trim_start_matches("www.").to_lowercase())
         .collect();
+    // Unrestricted, the crawler follows any anchor on the page to any host.
+    // With no explicit list, the hosts we were pointed at are the whole scope.
+    if allowed_domains.is_empty() {
+        allowed_domains = urls.iter().filter_map(|url| host_of(url)).collect();
+    }
     let keywords: Vec<String> = config
         .get("job_link_keywords")
         .and_then(Value::as_array)
@@ -362,6 +393,16 @@ fn start_urls(config: &Value) -> Vec<String> {
 
 /// An anchor is worth following when its host is allowed and either its text or
 /// its URL looks like a job posting.
+fn host_of(url: &str) -> Option<String> {
+    let url = Url::parse(url).ok()?;
+    (url.scheme() == "http" || url.scheme() == "https")
+        .then(|| {
+            url.host_str()
+                .map(|host| host.trim_start_matches("www.").to_lowercase())
+        })
+        .flatten()
+}
+
 fn is_job_link(
     link: &str,
     anchor: &str,
@@ -370,17 +411,11 @@ fn is_job_link(
     patterns: &[Regex],
 ) -> bool {
     let host_allowed = allowed_domains.is_empty()
-        || Url::parse(link)
-            .ok()
-            .and_then(|url| {
-                url.host_str()
-                    .map(|host| host.trim_start_matches("www.").to_lowercase())
-            })
-            .is_some_and(|host| {
-                allowed_domains
-                    .iter()
-                    .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
-            });
+        || host_of(link).is_some_and(|host| {
+            allowed_domains
+                .iter()
+                .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
+        });
     let searchable = format!("{} {}", link.to_lowercase(), anchor.to_lowercase());
     host_allowed
         && (keywords.iter().any(|keyword| searchable.contains(keyword))
@@ -1643,6 +1678,57 @@ mod tests {
         // Non-string entries are skipped and the list is capped at ten.
         let many: Vec<Value> = (0..12).map(|i| json!(format!("https://{i}"))).collect();
         assert_eq!(start_urls(&json!({"start_urls": many})).len(), 10);
+    }
+
+    #[test]
+    fn host_of_normalizes_and_rejects_anything_but_http() {
+        assert_eq!(
+            host_of("https://WWW.Example.com/jobs"),
+            Some("example.com".to_owned())
+        );
+        assert_eq!(
+            host_of("http://careers.example.com"),
+            Some("careers.example.com".to_owned())
+        );
+        // The crawler must not be talked into a local file or a script URL.
+        assert_eq!(host_of("file:///etc/passwd"), None);
+        assert_eq!(host_of("javascript:alert(1)"), None);
+        assert_eq!(host_of("/relative/path"), None);
+    }
+
+    #[test]
+    fn credentialed_sources_stay_off_until_their_keys_exist() {
+        let _guard = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: single-threaded test, no worker threads are running.
+        unsafe {
+            env::remove_var("REED_APP_KEY");
+            env::remove_var("ADZUNA_APP_ID");
+            env::remove_var("ADZUNA_APP_KEY");
+        }
+        assert!(!is_configured(&json!({"type": "reed"})));
+        unsafe { env::set_var("REED_APP_KEY", "key") };
+        assert!(is_configured(&json!({"type": "reed"})));
+
+        // Adzuna needs both halves.
+        unsafe { env::set_var("ADZUNA_APP_ID", "id") };
+        assert!(!is_configured(&json!({"type": "adzuna"})));
+        unsafe { env::set_var("ADZUNA_APP_KEY", "key") };
+        assert!(is_configured(&json!({"type": "adzuna"})));
+
+        unsafe {
+            env::remove_var("REED_APP_KEY");
+            env::remove_var("ADZUNA_APP_ID");
+            env::remove_var("ADZUNA_APP_KEY");
+        }
+        assert!(!is_configured(&json!({"type": "jooble"})));
+        // Anything that needs no credentials is always on.
+        assert!(is_configured(&json!({"url": "https://example/feed.rss"})));
+        assert!(is_configured(
+            &json!({"platform": "workable", "account_subdomain": "acme"})
+        ));
+        assert!(!is_configured(
+            &json!({"platform": "workable", "mode": "spi", "api_token_env": "NO_SUCH_TOKEN"})
+        ));
     }
 
     #[test]

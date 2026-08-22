@@ -82,12 +82,35 @@ impl Database {
         ))
     }
 
-    pub fn append_jobs(&mut self, rows: &[JobRow]) -> Result<()> {
+    /// The jobs, the application records they produced and the fingerprints
+    /// that mark them reviewed all land in one transaction. Split apart, a
+    /// failure between them either loses a job for good on the retry (its
+    /// fingerprint says reviewed, its row was never written) or re-alerts one
+    /// already stored.
+    pub fn commit_batch(
+        &mut self,
+        rows: &[JobRow],
+        applications: &[Value],
+        reviewed: &[String],
+        max_reviewed: usize,
+    ) -> Result<()> {
         let tx = self.connection.transaction()?;
         for row in rows {
+            if row.lead.link.is_empty() {
+                return Err("a job with no link cannot be stored or applied to".into());
+            }
             tx.execute("INSERT OR IGNORE INTO jobs(time,title,description,link,company,location,salary,source,employment_type,date_posted) VALUES(?,?,?,?,?,?,?,?,?,?)",
                 params![row.time,row.lead.title,row.lead.description,row.lead.link,row.lead.company,row.lead.location,row.lead.salary,row.lead.source,row.lead.employment_type,row.lead.date_posted])?;
         }
+        let next: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(position),-1)+1 FROM applications",
+            [],
+            |row| row.get(0),
+        )?;
+        for (offset, application) in applications.iter().enumerate() {
+            save_application(&tx, application, next + offset as i64)?;
+        }
+        insert_reviewed(&tx, reviewed, max_reviewed)?;
         tx.commit()?;
         Ok(())
     }
@@ -137,21 +160,7 @@ impl Database {
 
     pub fn append_reviewed(&mut self, fingerprints: &[String], max_items: usize) -> Result<()> {
         let tx = self.connection.transaction()?;
-        let mut position: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(position),-1)+1 FROM reviewed_fingerprints",
-            [],
-            |row| row.get(0),
-        )?;
-        for fingerprint in fingerprints {
-            if tx.execute(
-                "INSERT OR IGNORE INTO reviewed_fingerprints(position,fingerprint) VALUES(?,?)",
-                params![position, fingerprint],
-            )? > 0
-            {
-                position += 1;
-            }
-        }
-        trim_table(&tx, "reviewed_fingerprints", max_items)?;
+        insert_reviewed(&tx, fingerprints, max_items)?;
         tx.commit()?;
         Ok(())
     }
@@ -249,18 +258,6 @@ impl Database {
         Ok(())
     }
 
-    pub fn upsert_application(&mut self, record: &Value) -> Result<()> {
-        let position = self.connection.query_row(
-            "SELECT COALESCE(MAX(position),-1)+1 FROM applications",
-            [],
-            |row| row.get(0),
-        )?;
-        let tx = self.connection.transaction()?;
-        save_application(&tx, record, position)?;
-        tx.commit()?;
-        Ok(())
-    }
-
     pub fn telegram_offset(&self) -> Result<i64> {
         Ok(metadata(&self.connection, "telegram")?
             .get("update_offset")
@@ -349,6 +346,24 @@ fn table_columns(connection: &Connection, table: &str) -> Result<HashSet<String>
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
+fn insert_reviewed(tx: &Transaction<'_>, fingerprints: &[String], max_items: usize) -> Result<()> {
+    let mut position: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(position),-1)+1 FROM reviewed_fingerprints",
+        [],
+        |row| row.get(0),
+    )?;
+    for fingerprint in fingerprints {
+        if tx.execute(
+            "INSERT OR IGNORE INTO reviewed_fingerprints(position,fingerprint) VALUES(?,?)",
+            params![position, fingerprint],
+        )? > 0
+        {
+            position += 1;
+        }
+    }
+    trim_table(tx, "reviewed_fingerprints", max_items)
+}
+
 fn trim_table(tx: &Transaction<'_>, table: &str, max_items: usize) -> Result<()> {
     let count: i64 = tx.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
         row.get(0)
@@ -429,7 +444,13 @@ pub fn export_csv(path: impl AsRef<Path>, rows: &[JobRow]) -> Result<()> {
         output.push_str(
             &fields
                 .into_iter()
-                .map(|field| format!("\"{}\"", field.replace('"', "\"\"")))
+                // A field opening with one of these is a live formula in
+                // Excel and Sheets, and job text is not ours to trust.
+                .map(|field| {
+                    let lead = field.starts_with(['=', '+', '-', '@', '\t', '\r']);
+                    let quoted = field.replace('"', "\"\"");
+                    format!("\"{}{quoted}\"", if lead { "'" } else { "" })
+                })
                 .collect::<Vec<_>>()
                 .join(","),
         );
@@ -469,8 +490,13 @@ mod tests {
     #[test]
     fn database_round_trip() {
         let (_dir, mut db) = db();
-        db.append_jobs(&[row("2026-01-01T00:00:00Z", "Engineer", "https://example/1")])
-            .unwrap();
+        db.commit_batch(
+            &[row("2026-01-01T00:00:00Z", "Engineer", "https://example/1")],
+            &[],
+            &[],
+            10,
+        )
+        .unwrap();
         let jobs = db.jobs().unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].time, "2026-01-01T00:00:00Z");
@@ -480,13 +506,23 @@ mod tests {
     #[test]
     fn append_jobs_ignores_repeated_links() {
         let (_dir, mut db) = db();
-        db.append_jobs(&[
-            row("t1", "Engineer", "https://example/1"),
-            row("t1", "Analyst", "https://example/2"),
-        ])
+        db.commit_batch(
+            &[
+                row("t1", "Engineer", "https://example/1"),
+                row("t1", "Analyst", "https://example/2"),
+            ],
+            &[],
+            &[],
+            10,
+        )
         .unwrap();
-        db.append_jobs(&[row("t2", "Engineer again", "https://example/1")])
-            .unwrap();
+        db.commit_batch(
+            &[row("t2", "Engineer again", "https://example/1")],
+            &[],
+            &[],
+            10,
+        )
+        .unwrap();
         let titles: Vec<_> = db
             .jobs()
             .unwrap()
@@ -501,11 +537,16 @@ mod tests {
         let (_dir, mut db) = db();
         assert_eq!(db.latest_batch().unwrap(), (None, vec![]));
 
-        db.append_jobs(&[
-            row("2026-01-01T00:00:00Z", "Old", "https://example/1"),
-            row("2026-01-02T00:00:00Z", "New", "https://example/2"),
-            row("2026-01-02T00:00:00Z", "Newer", "https://example/3"),
-        ])
+        db.commit_batch(
+            &[
+                row("2026-01-01T00:00:00Z", "Old", "https://example/1"),
+                row("2026-01-02T00:00:00Z", "New", "https://example/2"),
+                row("2026-01-02T00:00:00Z", "Newer", "https://example/3"),
+            ],
+            &[],
+            &[],
+            10,
+        )
         .unwrap();
         let (timestamp, items) = db.latest_batch().unwrap();
         assert_eq!(timestamp.as_deref(), Some("2026-01-02T00:00:00Z"));
@@ -633,20 +674,22 @@ mod tests {
     }
 
     #[test]
-    fn upsert_application_is_keyed_on_the_link() {
+    fn committed_applications_are_keyed_on_the_link() {
         let (_dir, mut db) = db();
         let record = json!({"link": "https://example/1", "status": "new"});
-        db.upsert_application(&record).unwrap();
-        // A repeat sighting replaces rather than duplicates.
-        db.upsert_application(&record).unwrap();
-        // A linkless record cannot be keyed, so it is dropped.
-        db.upsert_application(&json!({"status": "no link"}))
-            .unwrap();
-
+        // A repeat sighting replaces rather than duplicates, and a linkless
+        // record cannot be keyed at all, so it is dropped.
+        db.commit_batch(
+            &[],
+            &[record.clone(), record, json!({"status": "no link"})],
+            &[],
+            10,
+        )
+        .unwrap();
         let stored = db.applications_state().unwrap();
         assert_eq!(stored["applications"].as_array().unwrap().len(), 1);
 
-        db.upsert_application(&json!({"link": "https://example/2"}))
+        db.commit_batch(&[], &[json!({"link": "https://example/2"})], &[], 10)
             .unwrap();
         assert_eq!(
             db.applications_state().unwrap()["applications"]
@@ -654,6 +697,43 @@ mod tests {
                 .unwrap()
                 .len(),
             2
+        );
+    }
+
+    #[test]
+    fn a_failed_batch_marks_nothing_reviewed_and_replays_cleanly() {
+        let (_dir, mut db) = db();
+        let good = row("t", "Engineer", "https://example/1");
+        let broken = row("t", "No link", "");
+        assert!(
+            db.commit_batch(
+                &[good.clone(), broken],
+                &[json!({"link": "https://example/1"})],
+                &["fp1".into()],
+                10,
+            )
+            .is_err()
+        );
+        // Nothing landed, so the retry can still see the job.
+        assert!(db.jobs().unwrap().is_empty());
+        assert!(!db.has_reviewed(&["fp1".into()]).unwrap());
+        assert_eq!(db.applications_state().unwrap()["applications"], json!([]));
+
+        db.commit_batch(
+            &[good],
+            &[json!({"link": "https://example/1"})],
+            &["fp1".into()],
+            10,
+        )
+        .unwrap();
+        assert_eq!(db.jobs().unwrap().len(), 1);
+        assert!(db.has_reviewed(&["fp1".into()]).unwrap());
+        assert_eq!(
+            db.applications_state().unwrap()["applications"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
         );
     }
 
@@ -740,6 +820,7 @@ mod tests {
         let csv_path = dir.path().join("out.csv");
         let mut quoted = row("t", "Engineer", "https://example/1");
         quoted.lead.company = "Acme \"Ltd\"".into();
+        quoted.lead.title = "=cmd|'/c calc'!A1".into();
         export_csv(&csv_path, &[quoted]).unwrap();
         let csv = fs::read_to_string(&csv_path).unwrap();
         let mut lines = csv.lines();
@@ -749,7 +830,7 @@ mod tests {
         );
         assert_eq!(
             lines.next().unwrap(),
-            "\"t\",\"Engineer\",\"Acme \"\"Ltd\"\"\",\"London\",\"£45000\",\"feed\",\"Permanent\",\"2026-01-01\",\"Description\",\"https://example/1\""
+            "\"t\",\"'=cmd|'/c calc'!A1\",\"Acme \"\"Ltd\"\"\",\"London\",\"£45000\",\"feed\",\"Permanent\",\"2026-01-01\",\"Description\",\"https://example/1\""
         );
         assert_eq!(lines.next(), None);
 

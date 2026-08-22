@@ -4,18 +4,21 @@ All notable changes to RoleForge are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.2.0] - 2026-08-22
 
 ### Added
 
 - Property-based tests for link normalization, whitespace cleaning, and truncation limits.
-- A unit-test suite covering matching, scraping, storage, config, and Telegram formatting (16 to 99 tests).
+- A unit-test suite covering matching, scraping, storage, config, and Telegram formatting (16 to 119 tests).
+- An end-to-end sweep test that drives collection, scoring, persistence, every export, the digest, and the alert outbox against an injected fetcher, with no network.
 - A `profiling` build profile and a `find-hotspots` skill for ranking CPU hotspots with samply.
 
 ### Fixed
 
 - Honoured explicit geographic lockouts for hybrid and onsite profiles; only remote matches were gated before.
 - Parsed salaries written with thousands separators, so `£45,000 - £55,000` no longer reads as no salary at all.
+- Committed jobs, their application records, and their review fingerprints in one transaction, and only after the alert queue is durable. A failure part-way through a sweep used to leave a posting fingerprinted as reviewed but never stored, hiding it for good on the retry.
+- Saved alert state after each Telegram delivery rather than after the whole queue, so a crash mid-batch no longer resends everything already sent.
 
 ### Changed
 
@@ -31,6 +34,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Merged the duplicated CDATA branch in `parse_feed` into the text branch, so CDATA now also fills `company`, `location`, and `date_posted`.
 - Backfilled historical review fingerprints in one transaction instead of one per stored job.
 - Defaulted `daily_digest` to unset; every reader already supplies its own fallback, so the defaults now live in one place.
+- Skipped Adzuna, Reed, Jooble, and SPI-mode Workable until their API keys are set, instead of polling, warning, and eventually raising a source-failure alert.
 - Cached compiled phrase patterns in `text::contains_phrase`, which was recompiling a regex on every call. Profiling put regex construction at ~70% of scoring CPU; it is now under 20% of a run five times shorter.
 
 ### Removed
@@ -44,6 +48,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - The dead `daily_digest.statuses` default, which was never read — digest filtering reads `include_statuses`.
 - The duplicated `OrElseString` traits, replaced by one `text::or_fallback`.
 - Chrono's unused `serde` feature.
+- `Database::append_jobs` and `Database::upsert_application`, both folded into `commit_batch`.
+
+### Security
+
+- Stripped the request URL from HTTP errors before they are logged or stored; Jooble's key sits in the path and Adzuna's in the query string.
+- Confined the generic scraper to the hosts of its own start URLs when no `allowed_domains` is configured, and rejected any scheme but HTTP and HTTPS. It would previously follow an anchor to any host.
+- Neutralised spreadsheet formulas in the CSV export by prefixing fields that open with `=`, `+`, `-`, `@`, a tab, or a carriage return.
 
 ## [0.1.0] - 2026-08-21
 
