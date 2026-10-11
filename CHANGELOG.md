@@ -4,6 +4,17 @@ All notable changes to RoleForge are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 
+## [0.2.2] - 2026-10-11
+
+### Changed
+
+- Converted repeated example assertions into 31 named `rstest` parameterized test groups across six modules, preserving existing cases and property tests.
+- Updated Rust dependencies.
+
+### Fixed
+
+- Adapted RSS and Atom parsing to the string-based event API in quick-xml 0.42.
+
 ## [0.2.1] - 2026-08-22
 
 ### Fixed

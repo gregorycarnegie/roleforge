@@ -145,7 +145,7 @@ pub fn parse_feed(xml: &str, source: &str) -> Result<Vec<JobLead>> {
     loop {
         match reader.read_event() {
             Ok(Event::Start(tag)) => {
-                let name = String::from_utf8_lossy(tag.local_name().as_ref()).to_lowercase();
+                let name = tag.local_name().as_ref().to_lowercase();
                 if name == "item" || name == "entry" {
                     current = Some(JobLead {
                         source: source.into(),
@@ -155,12 +155,11 @@ pub fn parse_feed(xml: &str, source: &str) -> Result<Vec<JobLead>> {
                 field = name;
             }
             Ok(Event::Empty(tag)) if current.is_some() => {
-                let name = String::from_utf8_lossy(tag.local_name().as_ref()).to_lowercase();
+                let name = tag.local_name().as_ref().to_lowercase();
                 if name == "link" {
                     for attribute in tag.attributes().flatten() {
-                        if attribute.key.local_name().as_ref() == b"href" {
-                            current.as_mut().expect("checked").link =
-                                clean(&String::from_utf8_lossy(&attribute.value));
+                        if attribute.key.local_name().as_ref() == "href" {
+                            current.as_mut().expect("checked").link = clean(&attribute.value);
                         }
                     }
                 }
@@ -171,15 +170,15 @@ pub fn parse_feed(xml: &str, source: &str) -> Result<Vec<JobLead>> {
             Ok(Event::Text(text)) if current.is_some() => absorb(
                 current.as_mut().expect("checked"),
                 &field,
-                &clean(&String::from_utf8_lossy(text.as_ref())),
+                &clean(text.as_ref()),
             ),
             Ok(Event::CData(text)) if current.is_some() => absorb(
                 current.as_mut().expect("checked"),
                 &field,
-                &clean(&String::from_utf8_lossy(text.as_ref())),
+                &clean(text.as_ref()),
             ),
             Ok(Event::End(tag)) => {
-                let name = String::from_utf8_lossy(tag.local_name().as_ref()).to_lowercase();
+                let name = tag.local_name().as_ref().to_lowercase();
                 if (name == "item" || name == "entry") && current.is_some() {
                     // dedupe_jobs drops the untitled and the linkless below.
                     jobs.push(current.take().expect("checked"));
@@ -945,6 +944,7 @@ fn dedupe_jobs(jobs: Vec<JobLead>) -> Vec<JobLead> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
     // --- feed parsing ----------------------------------------------------
 
@@ -1071,24 +1071,34 @@ mod tests {
 
     // --- config and JSON helpers -----------------------------------------
 
-    #[test]
-    fn cfg_and_display_name_read_string_keys() {
+    #[rstest]
+    #[case::string("name", "wwr")]
+    #[case::missing("missing", "")]
+    #[case::number("count", "")]
+    fn cfg_reads_string_keys(#[case] key: &str, #[case] expected: &str) {
         let config = json!({"name": "wwr", "display_name": "We Work Remotely", "count": 3});
-        assert_eq!(cfg(&config, "name"), "wwr");
-        assert_eq!(cfg(&config, "missing"), "");
-        assert_eq!(cfg(&config, "count"), "");
-        assert_eq!(display_name(&config), "We Work Remotely");
-        assert_eq!(display_name(&json!({"name": "wwr"})), "wwr");
-        assert_eq!(display_name(&json!({})), "");
+        assert_eq!(cfg(&config, key), expected);
     }
 
-    #[test]
-    fn value_text_cleans_strings_and_stringifies_the_rest() {
-        assert_eq!(value_text(Some(&json!("<b>Hi</b>  there"))), "Hi there");
-        assert_eq!(value_text(Some(&json!(null))), "");
-        assert_eq!(value_text(Some(&json!(42))), "42");
-        assert_eq!(value_text(Some(&json!(true))), "true");
-        assert_eq!(value_text(None), "");
+    #[rstest]
+    #[case::display_name(json!({"name": "wwr", "display_name": "We Work Remotely"}), "We Work Remotely")]
+    #[case::name_fallback(json!({"name": "wwr"}), "wwr")]
+    #[case::missing(json!({}), "")]
+    fn display_name_reads_string_keys(#[case] config: Value, #[case] expected: &str) {
+        assert_eq!(display_name(&config), expected);
+    }
+
+    #[rstest]
+    #[case::html(Some(json!("<b>Hi</b>  there")), "Hi there")]
+    #[case::null(Some(json!(null)), "")]
+    #[case::number(Some(json!(42)), "42")]
+    #[case::boolean(Some(json!(true)), "true")]
+    #[case::missing(None, "")]
+    fn value_text_cleans_strings_and_stringifies_the_rest(
+        #[case] value: Option<Value>,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(value_text(value.as_ref()), expected);
     }
 
     #[test]
@@ -1134,41 +1144,38 @@ mod tests {
 
     // --- salary formatting -----------------------------------------------
 
-    #[test]
-    fn formats_provider_salary() {
+    #[rstest]
+    #[case::range(Some(json!(30_000)), Some(json!(40_000)), "GBP 30000-40000 per year")]
+    #[case::rounded_string(Some(json!("30000.4")), None, "GBP 30000 per year")]
+    #[case::maximum_only(None, Some(json!(40_000)), "GBP 40000 per year")]
+    #[case::missing(None, None, "")]
+    #[case::invalid(Some(json!("n/a")), None, "")]
+    fn formats_provider_salary(
+        #[case] minimum: Option<Value>,
+        #[case] maximum: Option<Value>,
+        #[case] expected: &str,
+    ) {
         assert_eq!(
-            format_salary(Some(&json!(30_000)), Some(&json!(40_000)), "GBP", "year"),
-            "GBP 30000-40000 per year"
+            format_salary(minimum.as_ref(), maximum.as_ref(), "GBP", "year"),
+            expected
         );
-        assert_eq!(
-            format_salary(Some(&json!("30000.4")), None, "GBP", "year"),
-            "GBP 30000 per year"
-        );
-        assert_eq!(
-            format_salary(None, Some(&json!(40_000)), "GBP", "year"),
-            "GBP 40000 per year"
-        );
-        assert_eq!(format_salary(None, None, "GBP", "year"), "");
-        assert_eq!(format_salary(Some(&json!("n/a")), None, "GBP", "year"), "");
     }
 
-    #[test]
-    fn salary_text_reads_json_ld_shapes() {
-        let nested = json!({
+    #[rstest]
+    #[case::nested_range(Some(json!({
             "currency": "GBP",
             "value": {"minValue": 30000, "maxValue": 40000, "unitText": "YEAR"}
-        });
-        assert_eq!(salary_text(Some(&nested)), "GBP 30000-40000 per YEAR");
-
-        let single = json!({"currency": "USD", "value": {"value": 50000, "unitText": "HOUR"}});
-        assert_eq!(salary_text(Some(&single)), "USD 50000 per HOUR");
-
-        // No nested "value" object: min and max are read from the root.
-        let flat = json!({"currency": "EUR", "minValue": 10, "maxValue": 20});
-        assert_eq!(salary_text(Some(&flat)), "EUR 10-20 per ");
-
-        assert_eq!(salary_text(None), "");
-        assert_eq!(salary_text(Some(&json!("free text"))), "");
+        })), "GBP 30000-40000 per YEAR")]
+    #[case::nested_single(Some(json!({
+        "currency": "USD", "value": {"value": 50000, "unitText": "HOUR"}
+    })), "USD 50000 per HOUR")]
+    #[case::flat_range(Some(json!({
+        "currency": "EUR", "minValue": 10, "maxValue": 20
+    })), "EUR 10-20 per ")]
+    #[case::missing(None, "")]
+    #[case::free_text(Some(json!("free text")), "")]
+    fn salary_text_reads_json_ld_shapes(#[case] value: Option<Value>, #[case] expected: &str) {
+        assert_eq!(salary_text(value.as_ref()), expected);
     }
 
     // --- HTML scraping ---------------------------------------------------
@@ -1680,20 +1687,17 @@ mod tests {
         assert_eq!(start_urls(&json!({"start_urls": many})).len(), 10);
     }
 
-    #[test]
-    fn host_of_normalizes_and_rejects_anything_but_http() {
-        assert_eq!(
-            host_of("https://WWW.Example.com/jobs"),
-            Some("example.com".to_owned())
-        );
-        assert_eq!(
-            host_of("http://careers.example.com"),
-            Some("careers.example.com".to_owned())
-        );
-        // The crawler must not be talked into a local file or a script URL.
-        assert_eq!(host_of("file:///etc/passwd"), None);
-        assert_eq!(host_of("javascript:alert(1)"), None);
-        assert_eq!(host_of("/relative/path"), None);
+    #[rstest]
+    #[case::www_https("https://WWW.Example.com/jobs", Some("example.com"))]
+    #[case::subdomain_http("http://careers.example.com", Some("careers.example.com"))]
+    #[case::file("file:///etc/passwd", None)]
+    #[case::javascript("javascript:alert(1)", None)]
+    #[case::relative("/relative/path", None)]
+    fn host_of_normalizes_and_rejects_anything_but_http(
+        #[case] url: &str,
+        #[case] expected: Option<&str>,
+    ) {
+        assert_eq!(host_of(url).as_deref(), expected);
     }
 
     #[test]

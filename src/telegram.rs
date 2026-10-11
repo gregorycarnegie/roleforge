@@ -433,43 +433,43 @@ pub fn process_updates(db: &Database, timeout: u64) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
-    #[test]
-    fn parses_callback() {
-        assert_eq!(parse_digest_callback("digest:abc:2"), Some(("abc", "2")));
-        assert_eq!(parse_digest_callback("wrong:abc:2"), None);
-        assert_eq!(parse_digest_callback("digest:abc"), None);
-        assert_eq!(parse_digest_callback("digest:abc:2:3"), None);
-        assert_eq!(parse_digest_callback("digest::2"), None);
-        assert_eq!(parse_digest_callback("digest:abc:"), None);
+    #[rstest]
+    #[case::valid("digest:abc:2", Some(("abc", "2")))]
+    #[case::wrong_prefix("wrong:abc:2", None)]
+    #[case::missing_page("digest:abc", None)]
+    #[case::extra_field("digest:abc:2:3", None)]
+    #[case::empty_session("digest::2", None)]
+    #[case::empty_page("digest:abc:", None)]
+    fn parses_callback(#[case] data: &str, #[case] expected: Option<(&str, &str)>) {
+        assert_eq!(parse_digest_callback(data), expected);
     }
 
-    #[test]
-    fn builds_keyboard() {
-        assert!(digest_keyboard("abc", 0, 2).is_some());
-        assert!(digest_keyboard("abc", 0, 1).is_none());
-        assert!(digest_keyboard("abc", 0, 0).is_none());
+    #[rstest]
+    #[case::multiple_pages(2, true)]
+    #[case::single_page(1, false)]
+    #[case::no_pages(0, false)]
+    fn keyboard_needs_multiple_pages(#[case] total: usize, #[case] expected: bool) {
+        assert_eq!(digest_keyboard("abc", 0, total).is_some(), expected);
+    }
 
-        // First page: Previous is inert, Next moves forward.
-        let first = digest_keyboard("abc", 0, 3).unwrap();
-        let buttons = &first["inline_keyboard"][0];
-        assert_eq!(buttons[0]["callback_data"], "digest:abc:noop");
-        assert_eq!(buttons[1]["text"], "1/3");
+    #[rstest]
+    #[case::first(0, "digest:abc:noop", "1/3", "digest:abc:1")]
+    #[case::middle(1, "digest:abc:0", "2/3", "digest:abc:2")]
+    #[case::last(2, "digest:abc:1", "3/3", "digest:abc:noop")]
+    fn builds_keyboard(
+        #[case] page: usize,
+        #[case] previous: &str,
+        #[case] label: &str,
+        #[case] next: &str,
+    ) {
+        let keyboard = digest_keyboard("abc", page, 3).unwrap();
+        let buttons = &keyboard["inline_keyboard"][0];
+        assert_eq!(buttons[0]["callback_data"], previous);
+        assert_eq!(buttons[1]["text"], label);
         assert_eq!(buttons[1]["callback_data"], "digest:abc:noop");
-        assert_eq!(buttons[2]["callback_data"], "digest:abc:1");
-
-        // Middle page: both directions live.
-        let middle = digest_keyboard("abc", 1, 3).unwrap();
-        let buttons = &middle["inline_keyboard"][0];
-        assert_eq!(buttons[0]["callback_data"], "digest:abc:0");
-        assert_eq!(buttons[1]["text"], "2/3");
-        assert_eq!(buttons[2]["callback_data"], "digest:abc:2");
-
-        // Last page: Next is inert.
-        let last = digest_keyboard("abc", 2, 3).unwrap();
-        let buttons = &last["inline_keyboard"][0];
-        assert_eq!(buttons[0]["callback_data"], "digest:abc:1");
-        assert_eq!(buttons[2]["callback_data"], "digest:abc:noop");
+        assert_eq!(buttons[2]["callback_data"], next);
     }
 
     #[test]

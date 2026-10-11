@@ -92,22 +92,30 @@ pub fn strings(value: Option<&Value>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
     use serde_json::json;
 
-    #[test]
-    fn json_accessors_tolerate_wrong_shapes() {
-        let value =
-            json!({"name": "  Acme  ", "count": 3, "tags": ["a", "  ", " b "], "empty": []});
-        assert_eq!(string(value.get("name")), "Acme");
-        assert_eq!(string(value.get("count")), "");
-        assert_eq!(string(None), "");
+    #[rstest]
+    #[case::trimmed(Some(json!("  Acme  ")), "Acme")]
+    #[case::number(Some(json!(3)), "")]
+    #[case::missing(None, "")]
+    fn string_tolerates_wrong_shapes(#[case] value: Option<Value>, #[case] expected: &str) {
+        assert_eq!(string(value.as_ref()), expected);
+    }
 
-        assert_eq!(object(&value).len(), 4);
-        assert!(object(&json!("scalar")).is_empty());
+    #[rstest]
+    #[case::object(json!({"name": "Acme", "count": 3, "tags": ["a"], "empty": []}), 4)]
+    #[case::scalar(json!("scalar"), 0)]
+    fn object_tolerates_wrong_shapes(#[case] value: Value, #[case] expected_len: usize) {
+        assert_eq!(object(&value).len(), expected_len);
+    }
 
-        assert_eq!(strings(value.get("tags")), ["a", "b"]);
-        assert!(strings(value.get("empty")).is_empty());
-        assert!(strings(value.get("name")).is_empty());
-        assert!(strings(None).is_empty());
+    #[rstest]
+    #[case::trimmed(Some(json!(["a", "  ", " b "])), &["a", "b"])]
+    #[case::empty(Some(json!([])), &[])]
+    #[case::scalar(Some(json!("  Acme  ")), &[])]
+    #[case::missing(None, &[])]
+    fn strings_tolerates_wrong_shapes(#[case] value: Option<Value>, #[case] expected: &[&str]) {
+        assert_eq!(strings(value.as_ref()), expected);
     }
 }

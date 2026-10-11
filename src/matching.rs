@@ -620,6 +620,7 @@ const SENIORITY_WEIGHTS: &[(&str, i64)] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
     fn profile() -> ResumeProfile {
         ResumeProfile {
@@ -703,69 +704,58 @@ mod tests {
 
     // --- salary ----------------------------------------------------------
 
-    #[test]
-    fn parses_and_annualizes_salary() {
-        // Every currency and cadence is observable through the annualized GBP
-        // figures alone, which is all that scoring reads.
-        let annual = extract_salary("£40k - £50k per year").unwrap();
-        assert_eq!((annual.min_gbp, annual.max_gbp), (40_000, 50_000));
-
-        let hourly = extract_salary("£20 - £25 per hour").unwrap();
-        assert_eq!((hourly.min_gbp, hourly.max_gbp), (41_600, 52_000));
-
-        // A non-unit rate and multiplier together: catches a swapped * for /.
-        let usd = extract_salary("$60k - $80k").unwrap();
-        assert_eq!((usd.min_gbp, usd.max_gbp), (47_400, 63_200));
-
-        let monthly = extract_salary("5500 eur per month").unwrap();
-        assert_eq!(monthly.min_gbp, 56_760);
-
-        let daily = extract_salary("£450 per day").unwrap();
-        assert_eq!(daily.min_gbp, 117_000);
-    }
-
-    #[test]
-    fn rejects_unusable_salary_text() {
-        // An annual figure under £1000 is a typo or a fee, not a salary.
-        assert_eq!(extract_salary("£950 per year"), None);
-        assert_eq!(extract_salary("£1200 per year").unwrap().min_gbp, 1_200);
-        // The floor is exclusive: exactly £1000 a year still counts.
-        assert_eq!(extract_salary("£1000 per year").unwrap().min_gbp, 1_000);
-        assert_eq!(extract_salary("competitive salary"), None);
-        // Cadence is read from a window after the match, not the whole string:
-        // "per hour" falls outside it, so £45k stays an annual figure.
+    #[rstest]
+    #[case::annual("£40k - £50k per year", Some((40_000, 50_000)))]
+    #[case::hourly("£20 - £25 per hour", Some((41_600, 52_000)))]
+    #[case::usd("$60k - $80k", Some((47_400, 63_200)))]
+    #[case::monthly_eur("5500 eur per month", Some((56_760, 56_760)))]
+    #[case::daily("£450 per day", Some((117_000, 117_000)))]
+    #[case::below_floor("£950 per year", None)]
+    #[case::above_floor("£1200 per year", Some((1_200, 1_200)))]
+    #[case::exact_floor("£1000 per year", Some((1_000, 1_000)))]
+    #[case::unstated("competitive salary", None)]
+    #[case::cadence_outside_window(
+        "£45k for the role. Interviews are held per hour, weekly.",
+        Some((45_000, 45_000))
+    )]
+    fn parses_and_annualizes_salary(#[case] text: &str, #[case] expected: Option<(i64, i64)>) {
         assert_eq!(
-            extract_salary("£45k for the role. Interviews are held per hour, weekly.")
-                .unwrap()
-                .min_gbp,
-            45_000
+            extract_salary(text).map(|salary| (salary.min_gbp, salary.max_gbp)),
+            expected
         );
     }
 
-    #[test]
-    fn reads_every_supported_currency_token() {
-        assert_eq!(currency("GBP"), Some(1.0));
-        assert_eq!(currency(" £ "), Some(1.0));
-        assert_eq!(currency("us$"), Some(0.79));
-        assert_eq!(currency("euros"), Some(0.86));
-        assert_eq!(currency("€"), Some(0.86));
-        assert_eq!(currency("btc"), None);
+    #[rstest]
+    #[case::gbp("GBP", Some(1.0))]
+    #[case::pound_symbol(" £ ", Some(1.0))]
+    #[case::usd("us$", Some(0.79))]
+    #[case::euros("euros", Some(0.86))]
+    #[case::euro_symbol("€", Some(0.86))]
+    #[case::unsupported("btc", None)]
+    fn reads_every_supported_currency_token(#[case] token: &str, #[case] expected: Option<f64>) {
+        assert_eq!(currency(token), expected);
     }
 
-    #[test]
-    fn cadence_multipliers_cover_every_period() {
-        assert_eq!(cadence("paid hourly"), ("hour", 2080.0));
-        assert_eq!(cadence("£400 day rate"), ("day", 260.0));
-        assert_eq!(cadence("per month"), ("month", 12.0));
-        assert_eq!(cadence("nothing stated"), ("year", 1.0));
+    #[rstest]
+    #[case::hourly("paid hourly", ("hour", 2080.0))]
+    #[case::daily("£400 day rate", ("day", 260.0))]
+    #[case::monthly("per month", ("month", 12.0))]
+    #[case::default("nothing stated", ("year", 1.0))]
+    fn cadence_multipliers_cover_every_period(#[case] text: &str, #[case] expected: (&str, f64)) {
+        assert_eq!(cadence(text), expected);
     }
 
-    #[test]
-    fn amount_applies_the_thousands_suffix() {
-        assert_eq!(amount("40", Some("k")), Some(40_000.0));
-        assert_eq!(amount("40", None), Some(40.0));
-        assert_eq!(amount("1,250", None), Some(1250.0));
-        assert_eq!(amount("abc", None), None);
+    #[rstest]
+    #[case::thousands("40", Some("k"), Some(40_000.0))]
+    #[case::no_suffix("40", None, Some(40.0))]
+    #[case::comma("1,250", None, Some(1250.0))]
+    #[case::invalid("abc", None, None)]
+    fn amount_applies_the_thousands_suffix(
+        #[case] text: &str,
+        #[case] suffix: Option<&str>,
+        #[case] expected: Option<f64>,
+    ) {
+        assert_eq!(amount(text, suffix), expected);
     }
 
     // --- location --------------------------------------------------------
@@ -873,33 +863,55 @@ mod tests {
     // Regression: the lockout used to gate only the remote branch, so a job
     // restricted to another region was accepted as "local/hybrid compatible"
     // whenever the posting also named a preferred location.
-    #[test]
-    fn lockout_overrides_hybrid_and_onsite_fit() {
+    #[rstest]
+    #[case::hybrid(true, false)]
+    #[case::onsite(false, true)]
+    fn lockout_overrides_hybrid_and_onsite_fit(#[case] hybrid: bool, #[case] onsite: bool) {
         let text = "Hybrid role in our London office. Remote US only.";
-        for profile in [
-            ResumeProfile {
-                hybrid: true,
-                preferred_locations: vec!["london".into()],
-                ..ResumeProfile::default()
-            },
-            ResumeProfile {
-                onsite: true,
-                preferred_locations: vec!["london".into()],
-                ..ResumeProfile::default()
-            },
-        ] {
-            assert_eq!(
-                location_fit(text, &profile, &Geo::new(&profile)),
-                (false, "location reject: explicit geographic lockout")
-            );
-        }
+        let profile = ResumeProfile {
+            hybrid,
+            onsite,
+            preferred_locations: vec!["london".into()],
+            ..ResumeProfile::default()
+        };
+        assert_eq!(
+            location_fit(text, &profile, &Geo::new(&profile)),
+            (false, "location reject: explicit geographic lockout")
+        );
     }
 
     // Regression: these three all qualified against a London profile in a live
     // run, because the lockout was a raw substring of glue phrases and the
     // punctuation in "Remote (United States)" broke every one of them.
-    #[test]
-    fn scoped_remote_postings_elsewhere_are_rejected() {
+    #[rstest]
+    #[case::us_parentheses(
+        "Location: Remote (United States). Fully remote position.",
+        (false, "location reject: explicit geographic lockout")
+    )]
+    #[case::us_scope(
+        "This is a fully remote position open to candidates within the United States.",
+        (false, "location reject: explicit geographic lockout")
+    )]
+    #[case::ontario(
+        "Senior Application Support Engineer (Remote Ontario)",
+        (false, "location reject: explicit geographic lockout")
+    )]
+    #[case::frankfurt(
+        "Remote - Frankfurt, hybrid options available",
+        (false, "location reject: explicit geographic lockout")
+    )]
+    #[case::home_alias(
+        "Headquarters: Remote - Canada, France, UK",
+        (true, "location fit: remote compatible")
+    )]
+    #[case::unscoped_mention(
+        "Remote. We have a Berlin office too.",
+        (true, "location fit: remote compatible")
+    )]
+    fn scoped_remote_postings_respect_geography(
+        #[case] text: &str,
+        #[case] expected: (bool, &str),
+    ) {
         let londoner = ResumeProfile {
             remote: true,
             hybrid: true,
@@ -908,26 +920,7 @@ mod tests {
             ..ResumeProfile::default()
         };
         let geo = Geo::new(&londoner);
-        for text in [
-            "Location: Remote (United States). Fully remote position.",
-            "This is a fully remote position open to candidates within the United States.",
-            "Senior Application Support Engineer (Remote Ontario)",
-            "Remote - Frankfurt, hybrid options available",
-        ] {
-            assert_eq!(
-                location_fit(text, &londoner, &geo),
-                (false, "location reject: explicit geographic lockout"),
-                "{text}"
-            );
-        }
-        // A remote posting that also names somewhere reachable still fits, and
-        // "UK" counts even though the resume spells it "United Kingdom".
-        assert_eq!(
-            location_fit("Headquarters: Remote - Canada, France, UK", &londoner, &geo),
-            (true, "location fit: remote compatible")
-        );
-        // Naming a place without scoping wording is a mention, not a lockout.
-        assert!(location_fit("Remote. We have a Berlin office too.", &londoner, &geo).0);
+        assert_eq!(location_fit(text, &londoner, &geo), expected);
     }
 
     #[test]

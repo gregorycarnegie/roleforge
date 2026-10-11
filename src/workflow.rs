@@ -406,6 +406,7 @@ pub fn digest_due(config: &Value, last_date: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
     use std::env;
 
     const RESUME: &str = r#"{
@@ -643,48 +644,49 @@ mod tests {
         assert_eq!(digest["items"], json!([]));
     }
 
-    #[test]
-    fn digest_due_needs_enabled_the_hour_and_a_new_day() {
+    #[rstest]
+    #[case::hour_reached(json!({"hour_utc": 0}), false, true)]
+    #[case::hour_not_reached(json!({"hour_utc": 24}), false, false)]
+    #[case::disabled(json!({"enabled": false, "hour_utc": 0}), false, false)]
+    #[case::enabled(json!({"enabled": true, "hour_utc": 0}), false, true)]
+    #[case::already_sent(json!({"hour_utc": 0}), true, false)]
+    #[case::defaults_already_sent(json!({}), true, false)]
+    fn digest_due_needs_enabled_the_hour_and_a_new_day(
+        #[case] config: Value,
+        #[case] sent_today: bool,
+        #[case] expected: bool,
+    ) {
         let today = Utc::now().date_naive().to_string();
-
-        // hour_utc 0 is always reached; hour_utc 24 never is.
-        assert!(digest_due(&json!({"hour_utc": 0}), ""));
-        assert!(!digest_due(&json!({"hour_utc": 24}), ""));
-        assert!(!digest_due(&json!({"enabled": false, "hour_utc": 0}), ""));
-        assert!(digest_due(&json!({"enabled": true, "hour_utc": 0}), ""));
-        // Already sent today.
-        assert!(!digest_due(&json!({"hour_utc": 0}), &today));
-        // Defaults: enabled, and the 07:00 hour, so only the date is asserted.
-        assert!(!digest_due(&json!({}), &today));
+        assert_eq!(
+            digest_due(&config, if sent_today { &today } else { "" }),
+            expected
+        );
     }
 
-    #[test]
-    fn feed_interval_accepts_either_json_number_type() {
-        assert_eq!(feed_interval(&json!({"min_interval_seconds": 900})), 900.0);
-        assert_eq!(
-            feed_interval(&json!({"min_interval_seconds": 900.5})),
-            900.5
-        );
-        assert_eq!(
-            feed_interval(&json!({"min_interval_seconds": "900"})),
-            3600.0
-        );
-        assert_eq!(feed_interval(&json!({})), 3600.0);
+    #[rstest]
+    #[case::integer(json!({"min_interval_seconds": 900}), 900.0)]
+    #[case::float(json!({"min_interval_seconds": 900.5}), 900.5)]
+    #[case::string(json!({"min_interval_seconds": "900"}), 3600.0)]
+    #[case::missing(json!({}), 3600.0)]
+    fn feed_interval_accepts_either_json_number_type(#[case] config: Value, #[case] expected: f64) {
+        assert_eq!(feed_interval(&config), expected);
     }
 
-    #[test]
-    fn feeds_are_due_once_the_interval_has_fully_elapsed() {
-        let checked = |seconds| FeedState {
+    #[rstest]
+    #[case::never_polled(None, true)]
+    #[case::exact_interval(Some(100.0), true)]
+    #[case::overdue(Some(0.0), true)]
+    #[case::before_interval(Some(101.0), false)]
+    #[case::just_polled(Some(1_000.0), false)]
+    fn feeds_are_due_once_the_interval_has_fully_elapsed(
+        #[case] last_checked: Option<f64>,
+        #[case] expected: bool,
+    ) {
+        let state = last_checked.map(|seconds| FeedState {
             last_checked_at: seconds,
             consecutive_failures: 0,
-        };
-        // Never polled.
-        assert!(feed_due(None, 1_000.0, 900.0));
-        // Exactly at the interval counts as due.
-        assert!(feed_due(Some(&checked(100.0)), 1_000.0, 900.0));
-        assert!(feed_due(Some(&checked(0.0)), 1_000.0, 900.0));
-        assert!(!feed_due(Some(&checked(101.0)), 1_000.0, 900.0));
-        assert!(!feed_due(Some(&checked(1_000.0)), 1_000.0, 900.0));
+        });
+        assert_eq!(feed_due(state.as_ref(), 1_000.0, 900.0), expected);
     }
 
     #[test]
@@ -714,15 +716,28 @@ mod tests {
         assert!(source_failure_alert("wwr", "t", &after_failure(Some(&tenth))).is_none());
     }
 
-    #[test]
-    fn export_writes_only_a_batch_that_is_not_already_staged() {
+    #[rstest]
+    #[case::new_batch("t2", Some("t1"), Export::Batch)]
+    #[case::unstaged_batch("t1", None, Export::Batch)]
+    #[case::already_staged("t1", Some("t1"), Export::Skip)]
+    fn export_writes_only_a_batch_that_is_not_already_staged(
+        #[case] latest: &str,
+        #[case] staged: Option<&str>,
+        #[case] expected: Export,
+    ) {
         let never = || panic!("existence must not be checked when a batch exists");
-        assert_eq!(export_action(Some("t2"), Some("t1"), never), Export::Batch);
-        assert_eq!(export_action(Some("t1"), None, never), Export::Batch);
-        assert_eq!(export_action(Some("t1"), Some("t1"), never), Export::Skip);
-        // Nothing collected yet: seed an empty file, but never clobber one.
-        assert_eq!(export_action(None, None, || false), Export::Empty);
-        assert_eq!(export_action(None, None, || true), Export::Skip);
-        assert_eq!(export_action(None, Some("t1"), || true), Export::Skip);
+        assert_eq!(export_action(Some(latest), staged, never), expected);
+    }
+
+    #[rstest]
+    #[case::missing_file(None, false, Export::Empty)]
+    #[case::existing_file(None, true, Export::Skip)]
+    #[case::staged_file(Some("t1"), true, Export::Skip)]
+    fn export_without_a_batch_preserves_existing_files(
+        #[case] staged: Option<&str>,
+        #[case] exists: bool,
+        #[case] expected: Export,
+    ) {
+        assert_eq!(export_action(None, staged, || exists), expected);
     }
 }

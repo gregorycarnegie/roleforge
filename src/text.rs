@@ -205,44 +205,56 @@ pub fn truncate(value: &str, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
+
+    #[rstest]
+    #[case::html("<b>IT&nbsp; support</b>", "IT support")]
+    #[case::whitespace("  spaced \n out  ", "spaced out")]
+    #[case::entities("a &amp; b", "a & b")]
+    fn cleans_text(#[case] input: &str, #[case] expected: &str) {
+        assert_eq!(clean(input), expected);
+    }
 
     #[test]
-    fn cleans_and_matches_whole_phrases() {
-        assert_eq!(clean("<b>IT&nbsp; support</b>"), "IT support");
-        assert_eq!(clean("  spaced \n out  "), "spaced out");
-        assert_eq!(clean("a &amp; b"), "a & b");
+    fn normalizes_text() {
         assert_eq!(normalize("<b>IT Support</b>"), "it support");
-        assert!(contains_phrase(
-            "Senior IT   Support Engineer",
-            "it support"
-        ));
-        assert!(!contains_phrase("JavaScript", "java"));
-        assert!(!contains_phrase("anything", ""));
-        assert!(contains_phrase("Azure/Intune estate", "intune"));
     }
 
-    #[test]
-    fn or_fallback_substitutes_only_for_an_empty_string() {
-        assert_eq!(or_fallback(String::new(), "fallback"), "fallback");
-        assert_eq!(or_fallback("kept".to_owned(), "fallback"), "kept");
+    #[rstest]
+    #[case::whitespace("Senior IT   Support Engineer", "it support", true)]
+    #[case::whole_word("JavaScript", "java", false)]
+    #[case::empty_phrase("anything", "", false)]
+    #[case::punctuation("Azure/Intune estate", "intune", true)]
+    fn matches_whole_phrases(#[case] text: &str, #[case] phrase: &str, #[case] expected: bool) {
+        assert_eq!(contains_phrase(text, phrase), expected);
     }
 
-    #[test]
-    fn find_matches_keeps_order_dedupes_and_honours_the_limit() {
+    #[rstest]
+    #[case::empty("", "fallback")]
+    #[case::nonempty("kept", "kept")]
+    fn or_fallback_substitutes_only_for_an_empty_string(
+        #[case] input: &str,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(or_fallback(input.to_owned(), "fallback"), expected);
+    }
+
+    #[rstest]
+    #[case::unlimited("Azure and Intune estate", 0, &["intune", "azure"])]
+    #[case::capped("Azure and Intune estate", 1, &["intune"])]
+    #[case::below_limit("Azure and Intune estate", 5, &["intune", "azure"])]
+    #[case::no_matches("Nothing here", 3, &[])]
+    fn find_matches_keeps_order_dedupes_and_honours_the_limit(
+        #[case] text: &str,
+        #[case] limit: usize,
+        #[case] expected: &[&str],
+    ) {
         let phrases = ["intune".to_owned(), "azure".to_owned(), "intune".to_owned()];
-        assert_eq!(
-            find_matches("Azure and Intune estate", &phrases, 0),
-            ["intune", "azure"]
-        );
-        assert_eq!(
-            find_matches("Azure and Intune estate", &phrases, 1),
-            ["intune"]
-        );
-        assert_eq!(
-            find_matches("Azure and Intune estate", &phrases, 5),
-            ["intune", "azure"]
-        );
-        assert!(find_matches("Nothing here", &phrases, 3).is_empty());
+        assert_eq!(find_matches(text, &phrases, limit), expected);
+    }
+
+    #[test]
+    fn find_matches_with_no_phrases_is_empty() {
         assert!(find_matches("Azure", &[], 3).is_empty());
     }
 
@@ -261,75 +273,53 @@ mod tests {
         assert!(dedupe([]).is_empty());
     }
 
-    #[test]
-    fn strips_tracking_from_fingerprints() {
-        assert_eq!(
-            normalized_link("HTTPS://Example.com/jobs/1/?utm_source=x&keep=y#top"),
-            "https://example.com/jobs/1?keep=y"
-        );
-        assert_eq!(
-            normalized_link("https://example.com/jobs/1?ref=a&gclid=b&fbclid=c"),
-            "https://example.com/jobs/1"
-        );
-        // A bare path collapses to the root rather than an empty path.
-        assert_eq!(
-            normalized_link("https://example.com/"),
-            "https://example.com"
-        );
-        // Anything unparseable is passed through trimmed.
-        assert_eq!(normalized_link("  not a url  "), "not a url");
+    #[rstest]
+    #[case::preserves_nontracking_query(
+        "HTTPS://Example.com/jobs/1/?utm_source=x&keep=y#top",
+        "https://example.com/jobs/1?keep=y"
+    )]
+    #[case::tracking_only(
+        "https://example.com/jobs/1?ref=a&gclid=b&fbclid=c",
+        "https://example.com/jobs/1"
+    )]
+    #[case::root("https://example.com/", "https://example.com")]
+    #[case::unparseable("  not a url  ", "not a url")]
+    fn strips_tracking_from_fingerprints(#[case] input: &str, #[case] expected: &str) {
+        assert_eq!(normalized_link(input), expected);
     }
 
-    #[test]
-    fn splits_company_and_normalizes_suffix() {
+    #[rstest]
+    #[case::at("Engineer at Acme Ltd", "Engineer", "Acme Ltd")]
+    #[case::pipe("Engineer | Acme", "Engineer", "Acme")]
+    #[case::hyphen("Engineer - Acme", "Engineer", "Acme")]
+    #[case::company_first(
+        "Ignition, Inc.: Mac MSP Help Desk Guru (work from home)",
+        "Mac MSP Help Desk Guru (work from home)",
+        "Ignition, Inc."
+    )]
+    #[case::qualifier("Remote: IT Support Engineer", "Remote: IT Support Engineer", "")]
+    #[case::sentence(
+        "Now hiring for our London office: Engineer",
+        "Now hiring for our London office: Engineer",
+        ""
+    )]
+    #[case::empty_company("Engineer at ", "Engineer at", "")]
+    #[case::no_separator("Engineer", "Engineer", "")]
+    fn splits_company(#[case] input: &str, #[case] title: &str, #[case] company: &str) {
         assert_eq!(
-            split_title_company("Engineer at Acme Ltd"),
-            ("Engineer".into(), "Acme Ltd".into())
+            split_title_company(input),
+            (title.to_owned(), company.to_owned())
         );
-        assert_eq!(
-            split_title_company("Engineer | Acme"),
-            ("Engineer".into(), "Acme".into())
-        );
-        assert_eq!(
-            split_title_company("Engineer - Acme"),
-            ("Engineer".into(), "Acme".into())
-        );
-        // We Work Remotely and friends put the company first, behind a colon.
-        assert_eq!(
-            split_title_company("Ignition, Inc.: Mac MSP Help Desk Guru (work from home)"),
-            (
-                "Mac MSP Help Desk Guru (work from home)".into(),
-                "Ignition, Inc.".into()
-            )
-        );
-        // A qualifier or a sentence in front of the colon is not a company.
-        assert_eq!(
-            split_title_company("Remote: IT Support Engineer"),
-            ("Remote: IT Support Engineer".into(), String::new())
-        );
-        assert_eq!(
-            split_title_company("Now hiring for our London office: Engineer"),
-            (
-                "Now hiring for our London office: Engineer".into(),
-                String::new()
-            )
-        );
-        // A separator with nothing on one side is not a split.
-        assert_eq!(
-            split_title_company("Engineer at "),
-            ("Engineer at".into(), String::new())
-        );
-        assert_eq!(
-            split_title_company("Engineer"),
-            ("Engineer".into(), String::new())
-        );
+    }
 
-        assert_eq!(normalize_company("Acme Limited"), "acme");
-        assert_eq!(normalize_company("Acme, Inc."), "acme");
-        assert_eq!(normalize_company("Acme PLC"), "acme");
-        // Only a trailing suffix is stripped.
-        assert_eq!(normalize_company("Limited Edition Ltd"), "limited edition");
-        assert_eq!(normalize_company("Acme"), "acme");
+    #[rstest]
+    #[case::limited("Acme Limited", "acme")]
+    #[case::inc("Acme, Inc.", "acme")]
+    #[case::plc("Acme PLC", "acme")]
+    #[case::trailing_only("Limited Edition Ltd", "limited edition")]
+    #[case::no_suffix("Acme", "acme")]
+    fn normalizes_company_suffix(#[case] input: &str, #[case] expected: &str) {
+        assert_eq!(normalize_company(input), expected);
     }
 
     #[test]
@@ -378,14 +368,18 @@ mod tests {
         assert_ne!(digest("roleforge"), digest("roleforg"));
     }
 
-    #[test]
-    fn truncate_cuts_on_a_word_boundary() {
-        assert_eq!(truncate("short", 20), "short");
-        assert_eq!(truncate("  <b>short</b>  ", 20), "short");
-        assert_eq!(truncate("one two three four", 12), "one two…");
-        // No space to break on: the cut lands mid-word.
-        assert_eq!(truncate("abcdefghij", 5), "abcd…");
-        assert_eq!(truncate("exactly ten", 11), "exactly ten");
+    #[rstest]
+    #[case::short("short", 20, "short")]
+    #[case::html("  <b>short</b>  ", 20, "short")]
+    #[case::word_boundary("one two three four", 12, "one two…")]
+    #[case::midword("abcdefghij", 5, "abcd…")]
+    #[case::exact_limit("exactly ten", 11, "exactly ten")]
+    fn truncate_cuts_on_a_word_boundary(
+        #[case] input: &str,
+        #[case] limit: usize,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(truncate(input, limit), expected);
     }
 
     // Properties, not examples: these hold for every input, and the fingerprint
